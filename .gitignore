@@ -1,0 +1,9 @@
+*.check.txt
+*.bak-*
+*.rpp-bak
+*.reapeaks
+peaks/
+__pycache__/
+
+# worktrees live here, not tracked
+.claude/
