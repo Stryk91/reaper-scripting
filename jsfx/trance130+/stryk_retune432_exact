@@ -1,0 +1,257 @@
+desc:STRYK Retune 432 EXACT (A=440 -> A=432, fixed-ratio, low CPU)
+//tags: pitch tuning retune 432 concert pitch utility stereo
+//author: STRYK 144 pack
+
+/* ---------------------------------------------------------------------------
+   STRYK RETUNE 432 EXACT - specialist sibling of stryk_retune432
+
+   Same job, one ratio only, a fraction of the CPU. Use this when you are
+   retuning 440 -> 432 and nothing else, which is the only thing the 144 pack
+   ever actually does. If you need an arbitrary cents value, a reference other
+   than 432, or the dry/wet flanger, use stryk_retune432.
+
+   WHY IT IS CHEAPER: 432/440 IS EXACTLY 54/55
+   Not approximately - exactly. So the tap slides behind the write head at
+   exactly 1/55 sample per sample, and the fractional part of the read
+   position cycles through exactly 55 distinct values and no others, forever.
+
+   That kills the two per-sample costs in the general version:
+
+     1. Catmull-Rom coefficients. Only 55 fractional positions can ever occur,
+        so all 55 sets of basis weights are precomputed once at @init. Per
+        sample the interpolation is 4 buffer reads + 4 weight reads + 4
+        multiply-adds, instead of deriving c1/c2/c3 and running Horner.
+        This is EXACT, not an approximation - the weights are the same cubic
+        polynomial, regrouped as weights on the four taps. Verified against
+        the general version's cubic4() to 1.3e-15 over 55 x 400 random frames.
+
+     2. The raised-cosine crossfade. The general version calls cos() on ~30%
+        of samples (every sample where dph < xf_p). Here the window position
+        is an integer 0..ws-1, so the whole crossfade curve is a table built
+        on @slider and read with one index.
+
+   Also gone: a per-sample divide (drate/ws), five per-sample smoothing
+   multiply-adds, and the dry-path multiply-add.
+
+   WINDOW MUST BE EVEN
+   The second tap sits half a window away. With an EVEN window that is an
+   integer offset, so tap 2 lands on the same 55-value lattice and shares the
+   one weight table. With an odd window tap 2 is offset by half a sample and
+   needs its own 55 entries. Even is a simplification, not a correctness
+   requirement - the slider just snaps and nothing is lost, since one sample
+   of window length is inaudible.
+
+   BOOKKEEPING IS INTEGER
+   Delay is carried as (whole samples) + (k/55), k an integer 0..54, rather
+   than as a float phase accumulator. A float phase drifts; this cannot. The
+   window wrap subtracts an integer number of samples, so it leaves k
+   untouched and the lattice survives the splice.
+
+   WHAT IS IDENTICAL TO THE GENERAL VERSION
+   Two-tap crossfaded delay line, 4-point Catmull-Rom reads, raised-cosine
+   splice with g1 + g2 = 1 at all times, no tempo sync, no PDC (the delay is
+   time-varying, so there is no fixed latency to report). Wet is roughly
+   2..(2+window) samples late.
+
+   ALWAYS 100% WET. A retuner is a replace, not a parallel FX, and mixing a
+   time-varying delay against dry is a flanger. The general version keeps that
+   as a creative option; this one does not.
+--------------------------------------------------------------------------- */
+
+slider1:40<10,80,2>Window ms (grain size / formant feel)
+slider2:30<10,100,1>Crossfade (% of window)
+slider3:0<-12,12,0.1>Output Trim (dB)
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+@init
+
+ext_nodenorm = 1;
+
+DEN = 55;           // 432/440 = 54/55, so the tap moves 1/55 sample per sample
+
+// ---- memory layout ---------------------------------------------------------
+// bufL/bufR : audio ring buffers, power of two
+// wtab      : 55 x 4 Catmull-Rom basis weights
+// ktab      : per-k integer index adjustment (1 when k>0, else 0)
+// ftab      : per-k delay fraction k/55, used to interpolate the crossfade
+// xtab      : crossfade gain g1, one entry per sample of window position,
+//             plus one guard entry so the interpolation can read i+1
+
+need    = ceil(srate * 0.100) + 16;
+need    = min(max(need, 1024), 1048576);
+bufsize = 1024;
+while(bufsize < need) ( bufsize = bufsize * 2; );
+mask = bufsize - 1;
+
+bufL = 0;
+bufR = bufsize;
+wtab = bufR + bufsize;
+ktab = wtab + DEN * 4;
+ftab = ktab + DEN;
+xtab = ftab + DEN;
+xmax = 4096;                      // 80 ms at 48k is 3840; round up
+freembuf(xtab + xmax + 2);        // +2 for the interpolation guard entry
+memset(bufL, 0, bufsize * 2);
+
+// ---- the 55 weight sets ----------------------------------------------------
+// Read position is (write head - delay), and delay grows by 1/55 per sample,
+// so the position moves BACKWARDS through the fraction: k = 0 sits exactly on
+// a sample, and k > 0 sits (1 - k/55) of the way past the sample one lower.
+k = 0;
+while (k < DEN) (
+  ftab[k] = k / DEN;              // the delay's fractional part at this k
+  k > 0 ? (
+    f = 1 - k / DEN;
+    ktab[k] = 1;
+  ) : (
+    f = 0;
+    ktab[k] = 0;
+  );
+  f2 = f * f;
+  f3 = f2 * f;
+  wtab[k*4    ] = -0.5*f3 +     f2 - 0.5*f;   // weight on y[i-1]
+  wtab[k*4 + 1] =  1.5*f3 - 2.5*f2 + 1;       // weight on y[i]
+  wtab[k*4 + 2] = -1.5*f3 + 2.0*f2 + 0.5*f;   // weight on y[i+1]
+  wtab[k*4 + 3] =  0.5*f3 - 0.5*f2;           // weight on y[i+2]
+  k += 1;
+);
+
+// ---- state -----------------------------------------------------------------
+wp   = 0;
+kf   = 0;     // fractional index 0..54; delay fraction is kf/55
+dint = 2;     // whole-sample part of the delay; never less than 2
+ws   = 0;     // window in samples (even); set by build()
+
+function build() local(i, dph, xf, half) (
+  // Window, in samples, forced EVEN so the half-window tap stays on-lattice.
+  ws = floor(slider1 * 0.001 * srate);
+  ws = min(max(ws, 8), min(xmax, bufsize - 16));
+  ws = (ws * 0.5) | 0;
+  ws = ws * 2;
+  half = ws * 0.5;
+
+  // Crossfade table: g1 as a function of integer window position.
+  // Same raised cosine as the general version, evaluated ws times here
+  // instead of once per sample forever.
+  xf = max(0.02, min(slider2 * 0.005, 0.5));
+  i = 0;
+  while (i < ws) (
+    dph = i / ws;
+    dph = min(dph, 1 - dph);
+    xtab[i] = dph >= xf ? 1 : 0.5 - 0.5 * cos($pi * dph / xf);
+    i += 1;
+  );
+  // Guard entry: at i = ws the window has wrapped, so dph is 0 again and the
+  // curve is continuous with xtab[0]. Without it the per-sample interpolation
+  // would read uninitialised memory on the last sample of the window.
+  xtab[ws] = xtab[0];
+
+  // A shorter window can leave the delay past the new wrap point.
+  while (dint >= 2 + ws) ( dint -= ws; );
+  dint < 2 ? dint = 2;
+
+  trim = pow(10, slider3 / 20);
+);
+
+build();
+
+@slider
+build();
+
+@sample
+
+// ---- advance the exact 1/55, THEN write, THEN read -------------------------
+// Order matters and matches stryk_retune432. The write must land before the
+// read because the tap sits only 2 samples back, so the 4-point interpolator's
+// last point (base+2) can be the write head itself. Reading first leaves that
+// point holding whatever was in the ring a full buffer ago - a once-per-window
+// discontinuity that measured 57 dB down instead of vanishing.
+kf += 1;
+kf >= DEN ? (
+  kf = 0;
+  dint += 1;
+  dint >= 2 + ws ? ( dint -= ws; );
+);
+
+bufL[wp] = spl0;
+bufR[wp] = spl1;
+
+// ---- read tap 1 ------------------------------------------------------------
+// base is the integer sample the read sits on or just above; ktab shifts it
+// down by one whenever there is a fractional part.
+base = wp + bufsize - dint - ktab[kf];
+w    = wtab + kf * 4;
+
+// Crossfade gain. The window position is dint-2 whole samples plus kf/55, and
+// the raised cosine is steep enough (slope ~pi/2xf) that dropping that
+// fraction costs ~0.5% gain error right where the two taps differ most - it
+// measured 54 dB below signal. Interpolating the table costs two flops and
+// takes the error to the noise floor.
+xi = dint - 2;
+g1 = xtab[xi] + (xtab[xi + 1] - xtab[xi]) * ftab[kf];
+
+yl = w[0]*bufL[(base-1) & mask] + w[1]*bufL[base & mask]
+   + w[2]*bufL[(base+1) & mask] + w[3]*bufL[(base+2) & mask];
+yr = w[0]*bufR[(base-1) & mask] + w[1]*bufR[base & mask]
+   + w[2]*bufR[(base+1) & mask] + w[3]*bufR[(base+2) & mask];
+
+// ---- read tap 2 only while the splice is actually crossfading ---------------
+// Outside the crossfade region g1 is exactly 1, so tap 2 contributes nothing
+// and the whole second interpolation is skipped. At the default 30% that is
+// ~70% of samples running a single tap.
+g1 < 1 ? (
+  d2   = dint + ws * 0.5;
+  d2 >= 2 + ws ? ( d2 -= ws; );
+  base2 = wp + bufsize - d2 - ktab[kf];
+  g2    = 1 - g1;
+
+  yl = g1*yl + g2*(w[0]*bufL[(base2-1) & mask] + w[1]*bufL[base2 & mask]
+                 + w[2]*bufL[(base2+1) & mask] + w[3]*bufL[(base2+2) & mask]);
+  yr = g1*yr + g2*(w[0]*bufR[(base2-1) & mask] + w[1]*bufR[base2 & mask]
+                 + w[2]*bufR[(base2+1) & mask] + w[3]*bufR[(base2+2) & mask]);
+);
+
+spl0 = yl * trim;
+spl1 = yr * trim;
+
+wp = (wp + 1) & mask;
+
+@gfx 470 150
+gfx_a = 1;
+gfx_r = 0.07; gfx_g = 0.08; gfx_b = 0.11;
+gfx_rect(0, 0, gfx_w, gfx_h);
+gfx_setfont(1, "Arial", 15);
+
+gfx_r = 0.45; gfx_g = 0.85; gfx_b = 1.00;
+gfx_x = 12; gfx_y = 10;
+gfx_drawstr("RETUNE 432 EXACT    A4 440 -> 432    54/55    -31.767 cents");
+
+gfx_r = 0.80; gfx_g = 0.84; gfx_b = 0.90;
+gfx_x = 12; gfx_y = 34;
+sprintf(#s, "window %d smp (%.1f ms, even)   wrap every %.2f s",
+        ws, ws * 1000 / srate, ws * 55 / srate);
+gfx_drawstr(#s);
+
+gfx_x = 12; gfx_y = 56;
+sprintf(#s, "delay %d + %d/55 smp    crossfade %.0f%%    trim %+.1f dB",
+        dint, kf, slider2, slider3);
+gfx_drawstr(#s);
+
+gfx_r = 0.70; gfx_g = 0.95; gfx_b = 0.70;
+gfx_x = 12; gfx_y = 80;
+sprintf(#s, "F#2 90.82   F#4 363.27   F#6 1453.08 Hz   (at A=432)");
+gfx_drawstr(#s);
+
+// crossfade meter
+gfx_r = 0.22; gfx_g = 0.24; gfx_b = 0.29;
+gfx_rect(12, 108, 200, 10);
+gfx_r = 0.35; gfx_g = 0.75; gfx_b = 1.00;
+gfx_rect(12, 108, max(0, min(200, 200 * g1)), 10);
+gfx_r = 0.80; gfx_g = 0.84; gfx_b = 0.90;
+gfx_x = 224; gfx_y = 105;
+sprintf(#s, "tap1 %.0f%%  tap2 %.0f%%", g1 * 100, (1 - g1) * 100);
+gfx_drawstr(#s);

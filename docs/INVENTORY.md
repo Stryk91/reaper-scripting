@@ -11,8 +11,8 @@ config under `G:\tmp`. 1075 stock/vendor files were ignored.
 | type | files | distinct names |
 |---|---|---|
 | fxchain | 16 | 8 |
-| jsfx | 57 | 14 |
-| reascript | 19 | 9 |
+| jsfx | 59 | 15 |
+| reascript | 20 | 10 |
 
 ## Canonical location per asset
 
@@ -44,6 +44,7 @@ config under `G:\tmp`. 1075 stock/vendor files were ignored.
 | `stryk_monobass` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_monobass` | 3 | 1 |
 | `stryk_pump` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_pump` | 4 | 1 |
 | `stryk_retune432` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_retune432` | 4 | 2 **diverged** |
+| `stryk_retune432_exact` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_retune432_exact` | 2 | 1 |
 | `stryk_retune432_fixed` | jsfx | `(no pipelines copy)` | 1 | 1 |
 | `stryk_riser` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_riser` | 5 | 1 |
 | `stryk_scaleforce` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_scaleforce` | 4 | 1 |
@@ -52,3 +53,4 @@ config under `G:\tmp`. 1075 stock/vendor files were ignored.
 | `stryk_transient` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_transient` | 3 | 1 |
 | `stryk_tuner432` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_tuner432` | 5 | 3 **diverged** |
 | `stryk_width` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_width` | 4 | 2 **diverged** |
+| `verify_jsfx_render.lua` | reascript | `G:\pipelines\reaper-scripting\tools\verify_jsfx_render.lua` | 1 | 1 |

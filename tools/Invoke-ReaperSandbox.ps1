@@ -28,6 +28,12 @@
 .PARAMETER KeepOpen
   Leave the sandbox instance running instead of killing it when done.
 
+.PARAMETER StageEffects
+  Copy Effects\stryk and FXChains from the real profile into the sandbox.
+  Required to test anything that loads an on-disk JSFX: -cfgfile moves the whole
+  resource path, so without this TrackFX_AddByName returns -1 for every JSFX and
+  looks exactly like a broken effect.
+
 .EXAMPLE
   .\Invoke-ReaperSandbox.ps1 -Script .\tools\check_reascript.lua -Headless
 #>
@@ -39,6 +45,7 @@ param(
   [string]$DesktopName = 'ReaperHeadless',
   [switch]$Headless,
   [switch]$KeepOpen,
+  [switch]$StageEffects,
   [int]$TimeoutSec = 25
 )
 
@@ -56,6 +63,23 @@ if (Test-Path $SourceIni) {
     Set-Content $ini -Encoding ASCII
 } else {
   "[REAPER]`nvstpath=`nvstpath64=" | Set-Content $ini -Encoding ASCII
+}
+
+# -cfgfile relocates REAPER's ENTIRE resource path to the ini's folder, not just
+# its settings. GetResourcePath() in the sandbox returns this directory, so the
+# real profile's Effects, FXChains and Scripts are all invisible. Built-in Cockos
+# FX still work (ReaSamplOmatic5000 is not a file on disk), which is why script
+# tests passed for months without anyone noticing - but an on-disk JSFX resolves
+# to -1 from TrackFX_AddByName, indistinguishable from "your JSFX is broken".
+if ($StageEffects) {
+  foreach ($sub in @('Effects\stryk', 'FXChains')) {
+    $src = Join-Path (Split-Path $SourceIni -Parent) $sub
+    if (-not (Test-Path $src)) { continue }
+    $dst = Join-Path $sandboxDir $sub
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Copy-Item (Join-Path $src '*') $dst -Recurse -Force
+    Write-Host "sandbox: staged $sub ($((Get-ChildItem $dst -File).Count) files)"
+  }
 }
 
 # Only ever kill instances we started.

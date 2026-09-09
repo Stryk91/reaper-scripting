@@ -24,6 +24,7 @@ copies into REAPER.
 | `tools/check_reascript.lua` | Compiles a script and nil-checks every `reaper.*` symbol it calls, without running it. |
 | `tools/Invoke-ReaperSandbox.ps1` | Runs a script in an isolated REAPER instance, optionally fully off-screen. |
 | `tools/inventory.py` | Finds every REAPER asset on the box and groups by content hash. `--markdown` regenerates `docs/INVENTORY.md`. |
+| `tools/verify_jsfx_render.lua` | Renders audio through a JSFX and reports the output file — the only check that proves a JSFX actually compiled. |
 | `tools/install_midi_strip_pc.py` | Installs the program-change stripper *and* wires its startup hook. `--status`, `--uninstall`. |
 | `tools/strip_pc.py` | Offline program-change stripper for `.mid` files on disk. |
 | `tools/Copy-DCBrief.ps1` | Puts `docs/DC-BRIEF.md` on the clipboard. `-WithScript` appends the full source. |
@@ -83,6 +84,42 @@ debugging session — see `docs/2026-09-10-build-rs5k-diagnosis.md`.
 `[modified]`. Use the sandbox. It always disables VST scanning — a fresh instance that
 inherits the real VST paths re-scans every plugin (minutes); blanked, it launches in ~12 s.
 Built-in Cockos FX like ReaSamplOmatic5000 are unaffected, they are not VSTs on disk.
+
+**3. `-cfgfile` moves the whole resource path.** Not just the settings file —
+`GetResourcePath()` inside the sandbox returns the sandbox folder, so the real profile's
+`Effects`, `FXChains` and `Scripts` are all invisible. An on-disk JSFX then resolves to
+`-1` from `TrackFX_AddByName`, which is **indistinguishable from a broken effect**. This
+went unnoticed for months because script tests only used built-in FX. Pass `-StageEffects`
+to copy `Effects\stryk` and `FXChains` in first:
+
+```powershell
+.\tools\Invoke-ReaperSandbox.ps1 -Script .\tools\verify_jsfx_render.lua -Headless -StageEffects
+```
+
+## Verifying a JSFX
+
+**Loading a JSFX proves nothing.** One with a real EEL2 syntax error still instantiates,
+still returns a valid index from `TrackFX_AddByName`, and still reports its full slider
+list from `TrackFX_GetNumParams`. Every cheap check passes on a broken effect. Only audio
+that came out the other side is evidence.
+
+`tools/verify_jsfx_render.lua` does that: it pushes a wav through the effect using
+*Item: Apply track/take FX to items* (action 40209), which bounces to a new take backed by
+a new file, and reports that file's path. Configure it via
+`%TEMP%\reaper-sandbox\verify_jsfx.cfg`:
+
+```
+wav=C:\path\to\test.wav
+fx=stryk_retune432_exact
+report=C:\path\to\report.txt
+```
+
+Then analyse the rendered file outside REAPER. For `stryk_retune432_exact` the test is a
+440 Hz sine in, 432 Hz out — measured 431.93 Hz, i.e. −32.05 cents against the −31.767
+target, the residual being estimator precision rather than pitch error.
+
+Remember EEL2 has **no scientific-notation literals** — `1e30` is a syntax error, not a
+big number.
 
 ## Working on this repo with DC (Claude Desktop)
 
