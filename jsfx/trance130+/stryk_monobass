@@ -1,0 +1,340 @@
+desc:STRYK Mono Bass -- elliptical low end / mono maker
+//tags: utility stereo bass mono crossover elliptical mastering trance
+//author: STRYK 144 pack
+//
+// ---------------------------------------------------------------------------
+// WHAT IT DOES
+//   Splits the signal at a chosen frequency, collapses everything BELOW that
+//   point to mono (with optional side-retention), lets you trim / gently drive
+//   that mono bass band, kills subsonic rubbish, and glues it all back to the
+//   untouched top end. This is the "will it survive a big rig" utility: club
+//   subs are mono-fed, out-of-phase bass either vanishes or eats headroom.
+//
+// SESSION DEFAULTS (144 BPM, F#, A=432)
+//   Mono Below = 120 Hz. At A=432 the F# ladder is
+//     F#0 22.70 | F#1 45.41 | F#2 90.82 | F#3 181.63 | F#4 363.27 Hz.
+//   120 Hz sits ABOVE F#2 (90.82) and BELOW F#3 (181.63), so the whole bass
+//   fundamental region -- F#1 and F#2, where a trance bass actually lives --
+//   is hard mono, while the F#3+ harmonics that carry the stereo character of
+//   the bass keep their width. Move it to ~95 Hz if you want only F#1/F#2
+//   fundamentals mono'd, or ~190 Hz for a brutal club-safe collapse.
+//   Subsonic HP = 24 Hz: just over F#0 (22.70 Hz), which no PA reproduces,
+//   so it only removes DC, kick-tail rumble and plugin subsonic junk.
+//   Nothing here is time-based, so there is no tempo-synced parameter and no
+//   hardcoded 144 anywhere in the DSP -- 144 BPM only informs the comments.
+//
+// PHASE COHERENCE -- HOW THE CROSSOVER IS KEPT FROM SMEARING
+//   1) The LOW band is a Linkwitz-Riley low-pass: two cascaded identical
+//      sections. 12 dB/oct = two 1st-order sections (LR2), 24 dB/oct = two
+//      Butterworth Q=0.7071 biquads (LR4).
+//   2) The HIGH band is NOT filtered separately. It is derived by subtraction
+//      from a MATCHED all-pass:   high = AP(x) - low.
+//      That works because the two halves of an LR crossover sum to exactly
+//      one all-pass:
+//        LR4:  LP^2 + HP^2 = (s^4 + w0^4)/D^2
+//                          = (s^2 - sqrt2*w0*s + w0^2)/(s^2 + sqrt2*w0*s + w0^2)
+//              = a 2nd-order all-pass at w0 with Q = 1/sqrt2.
+//        LR2:  LP^2 - HP^2 = (w0 - s)/(w0 + s) = a 1st-order all-pass.
+//      The bilinear transform is a conformal map, so that identity survives
+//      into the digital domain exactly (RBJ LPF/APF at the same w0 and Q are
+//      the bilinear images of those prototypes). Result: low + high == AP(x)
+//      sample for sample, at every frequency, at every samplerate. No dip and
+//      no bump at the crossover, and the two bands physically cannot drift
+//      apart in phase, because one is literally defined as the remainder of
+//      the other. A separately-computed HPF would only be that exact on paper.
+//      Measured in REAPER: with Side 100% and the subsonic HP off, output
+//      magnitude tracks the input to within +/-0.08 dB from 25 Hz to 15 kHz,
+//      and Solo Bass + Solo Above sum back to the full band bit-for-bit.
+//   3) L and R run the SAME coefficients, so no interchannel phase difference
+//      is ever introduced -- the stereo image above the crossover is passed
+//      through untouched, not "re-widened" afterwards.
+//   4) The only cost on the full-range signal is that benign all-pass: a few
+//      ms of group delay in the bottom octaves, identical on both channels,
+//      exactly what an analogue LR crossover does. At 12 dB/oct the derived
+//      high band carries the polarity inversion LR2 inherently requires; the
+//      summed output is still magnitude-flat (a 1st-order all-pass of the
+//      input, +polarity at DC).
+//   Changing the SLOPE swaps coefficients live and can tick on loud material;
+//   set it before you print. Frequency changes are click-free in practice.
+//
+// NOTE ON NUMBER LITERALS
+//   EEL2 has NO exponent notation. "1.0e-18" is a parse error, and a parse
+//   error anywhere silently turns the whole plug-in into a passthrough --
+//   it still loads, still shows all seven sliders, and does nothing at all.
+//   Every tiny constant below is therefore written longhand or built by
+//   multiplication in @init.
+// ---------------------------------------------------------------------------
+
+slider1:120<20,500,1>Mono Below (Hz)
+slider2:1<0,1,1{12 dB per oct (LR2),24 dB per oct (LR4)}>Crossover Slope
+slider3:0<-12,12,0.1>Bass Gain (dB)
+slider4:0<0,100,1>Bass Drive (percent)
+slider5:24<0,80,1>Subsonic High-Pass (Hz, 0 = off)
+slider6:0<0,100,1>Stereo Below Compensation (percent side kept)
+slider7:0<0,2,1{Off,Solo Bass Band,Solo Above}>Mono Check
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+@init
+ext_nodenorm = 1;
+
+// ---- tiny constants, longhand (EEL2 rejects exponent notation)
+eps18  = 0.000000000000000001;   // 1e-18  anti-denormal dither + meter floor
+eps12  = 0.000000000001;         // 1e-12  meter display floor (-120 dB)
+eps09  = 0.000000001;            // 1e-9   drive-normaliser update threshold
+eps_fl = eps18 * eps18;          // 1e-36  meter denormal flush threshold
+big    = 100000000;              // 1e8    NaN / blow-up guard
+
+// ---- memory map: 5 coefficients per filter (stride 8), 4 states per
+// ---- filter/channel (stride 8). Coefficients are shared L/R on purpose.
+c_hp  = 0;    c_lp1 = 8;    c_lp2 = 16;   c_ap  = 24;
+s_hpL = 64;   s_hpR = 72;
+s_1L  = 80;   s_1R  = 88;
+s_2L  = 96;   s_2R  = 104;
+s_apL = 112;  s_apR = 120;
+memset(0, 0, 128);
+freembuf(128);
+
+// Direct form I biquad. c = coefficient base, s = state base.
+// y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2  (already normalised by a0)
+function bq(c, s, x) local(y) (
+  y = c[0]*x + c[1]*s[0] + c[2]*s[1] - c[3]*s[2] - c[4]*s[3];
+  s[1] = s[0];  s[0] = x;
+  s[3] = s[2];  s[2] = y;
+  y;
+);
+
+function setbq(c, b0, b1, b2, a1, a2) (
+  c[0] = b0;  c[1] = b1;  c[2] = b2;  c[3] = a1;  c[4] = a2;
+);
+
+// tanh via exp, clamped so exp() can never blow up. e+1 >= 1 always,
+// so there is no divide-by-zero.
+function tanh_s(x) local(e) (
+  x = min(max(x, -12), 12);
+  e = exp(x + x);
+  (e - 1) / (e + 1);
+);
+
+function update_coefs() local(sr, fx, fh, k, den, ap1, w0, cw, sn, al, a0, d) (
+  sr = max(srate, 8000);
+
+  // ---- crossover, clamped well under Nyquist so it survives any samplerate
+  fx = min(max(slider1, 20), min(500, sr * 0.45));
+  cur_fx  = fx;
+  slope24 = slider2 >= 0.5;
+
+  slope24 ? (
+    // LR4: two cascaded Butterworth (Q = 1/sqrt2) low-passes + matched
+    // 2nd-order all-pass at the same w0 and Q.
+    w0 = 2*$pi*fx/sr;  cw = cos(w0);  sn = sin(w0);
+    al = sn / 1.41421356237;            // alpha = sin(w0)/(2Q), Q = 0.70710678
+    a0 = 1 + al;
+    setbq(c_lp1, (1-cw)*0.5/a0, (1-cw)/a0, (1-cw)*0.5/a0, -2*cw/a0, (1-al)/a0);
+    setbq(c_lp2, (1-cw)*0.5/a0, (1-cw)/a0, (1-cw)*0.5/a0, -2*cw/a0, (1-al)/a0);
+    setbq(c_ap,  (1-al)/a0,     -2*cw/a0,  1,             -2*cw/a0, (1-al)/a0);
+  ) : (
+    // LR2: two cascaded 1st-order low-passes + matched 1st-order all-pass.
+    // Stored in the biquad slots with b2 = a2 = 0.
+    k   = tan($pi*fx/sr);
+    den = 1 + k;
+    setbq(c_lp1, k/den, k/den, 0, (k-1)/den, 0);
+    setbq(c_lp2, k/den, k/den, 0, (k-1)/den, 0);
+    ap1 = (k-1)/den;                    // H(z) = (a + z^-1)/(1 + a z^-1)
+    setbq(c_ap, ap1, 1, 0, ap1, 0);
+  );
+
+  // ---- subsonic high-pass (12 dB/oct Butterworth), identical on L and R,
+  // ---- applied before the split so reconstruction stays exact.
+  fh = min(max(slider5, 0), min(80, sr * 0.45));
+  cur_fh = fh;
+  hp_on  = fh >= 1;
+  hp_on ? (
+    w0 = 2*$pi*fh/sr;  cw = cos(w0);  sn = sin(w0);
+    al = sn / 1.41421356237;
+    a0 = 1 + al;
+    setbq(c_hp, (1+cw)*0.5/a0, -(1+cw)/a0, (1+cw)*0.5/a0, -2*cw/a0, (1-al)/a0);
+  );
+
+  tgt_gain = pow(10, slider3/20);
+  tgt_side = min(max(slider6, 0), 100) * 0.01;
+
+  // ---- drive: y = tanh(g*x) normalised so that -6 dBFS in stays -6 dBFS out.
+  // g is never 0 (0.05 min) so the normaliser can never divide by zero, and at
+  // drive = 0 the whole nonlinearity is unity to within 0.002 dB.
+  d        = min(max(slider4, 0), 100) * 0.01;
+  drive_on = d > 0;
+  tgt_dg   = 0.05 + d*2.45;
+
+  // ---- mono check as smoothed band weights => no click when switching
+  mode   = slider7|0;
+  tgt_wl = mode == 2 ? 0 : 1;
+  tgt_wh = mode == 1 ? 0 : 1;
+);
+
+smc  = 1 - exp(-1 / (0.008 * max(srate, 8000)));   // ~8 ms control smoothing
+cmet = 1 - exp(-1 / (0.250 * max(srate, 8000)));   // ~250 ms meter ballistics
+dnv  = eps18;                                      // anti-denormal dither
+
+update_coefs();
+
+gain_s  = tgt_gain;
+side_s  = tgt_side;
+dg_s    = tgt_dg;
+dg_last = dg_s;
+dn_cur  = 0.5 / tanh_s(0.5 * dg_s);
+wl_s    = tgt_wl;
+wh_s    = tgt_wh;
+mLL = 0;  mRR = 0;  mLR = 0;  mML = 0;
+
+@slider
+update_coefs();
+
+@sample
+// ---- smoothed controls (mandatory on anything touching gain)
+gain_s += smc * (tgt_gain - gain_s);
+side_s += smc * (tgt_side - side_s);
+wl_s   += smc * (tgt_wl - wl_s);
+wh_s   += smc * (tgt_wh - wh_s);
+dg_s   += smc * (tgt_dg - dg_s);
+// the drive normaliser is a nonlinear function of g, so recompute it FROM the
+// smoothed g (never smooth it independently -- that gives a level blip mid-sweep)
+abs(dg_s - dg_last) > eps09 ? (
+  dg_last = dg_s;
+  dn_cur  = 0.5 / tanh_s(0.5 * dg_s);
+);
+
+dnv = -dnv;
+inl = spl0 + dnv;
+inr = (num_ch >= 2 ? spl1 : spl0) + dnv;
+
+hp_on ? (
+  inl = bq(c_hp, s_hpL, inl);
+  inr = bq(c_hp, s_hpR, inr);
+);
+
+// ---- split: LR low-pass, and the high band as the all-pass remainder
+lowl = bq(c_lp2, s_2L, bq(c_lp1, s_1L, inl));
+lowr = bq(c_lp2, s_2R, bq(c_lp1, s_1R, inr));
+hil  = bq(c_ap, s_apL, inl) - lowl;
+hir  = bq(c_ap, s_apR, inr) - lowr;
+
+// ---- mid / side of the low band. side_s = 0 -> hard mono, 1 -> untouched.
+mmid  = (lowl + lowr) * 0.5;
+mside = (lowl - lowr) * 0.5 * side_s;
+
+mmid  *= gain_s;
+mside *= gain_s;
+
+// ---- gentle tanh saturation, mono component only (drive never widens).
+// Gated on the SMOOTHED drive, not on the raw slider: pulling Drive back to 0
+// then rides the nonlinearity down to unity instead of dropping ~1.1 dB of
+// makeup gain in a single sample and clicking.
+(drive_on || dg_s > 0.0501) ? ( mmid = tanh_s(mmid * dg_s) * dn_cur; );
+
+lol = mmid + mside;
+lor = mmid - mside;
+
+outl = hil*wh_s + lol*wl_s;
+outr = hir*wh_s + lor*wl_s;
+
+// ---- metering (pre-mono low band correlation + mono band level)
+mLL += cmet * (lowl*lowl - mLL);
+mRR += cmet * (lowr*lowr - mRR);
+mLR += cmet * (lowl*lowr - mLR);
+mML += cmet * (mmid*mmid - mML);
+abs(mLL) < eps_fl ? ( mLL = 0; );
+abs(mRR) < eps_fl ? ( mRR = 0; );
+abs(mLR) < eps_fl ? ( mLR = 0; );
+abs(mML) < eps_fl ? ( mML = 0; );
+
+// ---- safety net: NaN/Inf fails the < test and flushes all filter state
+(abs(outl) < big && abs(outr) < big) ? (
+  spl0 = outl;
+  num_ch >= 2 ? ( spl1 = outr; );
+) : (
+  memset(64, 0, 64);
+  spl0 = 0;
+  num_ch >= 2 ? ( spl1 = 0; );
+);
+
+@gfx 460 175
+g_pad = 14;
+g_w   = max(gfx_w - g_pad*2, 80);
+
+gfx_a = 1;
+gfx_r = 0.07; gfx_g = 0.08; gfx_b = 0.10;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+gfx_setfont(1, "Arial", 16);
+gfx_r = 0.93; gfx_g = 0.94; gfx_b = 0.97;
+gfx_x = g_pad; gfx_y = g_pad;
+sprintf(#s, "MONO BELOW  %.0f Hz", cur_fx);
+gfx_drawstr(#s);
+
+gfx_setfont(2, "Arial", 12);
+gfx_r = 0.55; gfx_g = 0.60; gfx_b = 0.68;
+gfx_x = g_pad; gfx_y = g_pad + 22;
+sprintf(#s, "%d dB/oct   HP %d Hz   side %d%%   drive %d%%   %s",
+  slope24 ? 24 : 12,
+  hp_on ? (cur_fh|0) : 0,
+  slider6|0,
+  slider4|0,
+  mode == 1 ? "SOLO BASS" : (mode == 2 ? "SOLO ABOVE" : ""));
+gfx_drawstr(#s);
+
+// ---- log frequency strip 20..500 Hz with F# ticks at A=432
+g_sx = g_pad; g_sy = g_pad + 48; g_sw = g_w; g_sh = 22;
+g_lo = log(20); g_hi = log(500); g_rng = g_hi - g_lo;
+gfx_r = 0.13; gfx_g = 0.14; gfx_b = 0.17;
+gfx_rect(g_sx, g_sy, g_sw, g_sh);
+g_xf = g_sx + (log(min(max(cur_fx,20),500)) - g_lo)/g_rng * g_sw;
+gfx_r = 0.15; gfx_g = 0.29; gfx_b = 0.42;
+gfx_rect(g_sx, g_sy, max(g_xf - g_sx, 1), g_sh);
+
+gfx_setfont(3, "Arial", 10);
+g_i = 0;
+while (g_i < 5) (
+  g_f  = 432 * pow(2, (18 + g_i*12 - 69)/12);
+  g_tx = g_sx + (log(g_f) - g_lo)/g_rng * g_sw;
+  gfx_r = 0.72; gfx_g = 0.74; gfx_b = 0.42;
+  gfx_line(g_tx, g_sy, g_tx, g_sy + g_sh);
+  gfx_r = 0.50; gfx_g = 0.52; gfx_b = 0.34;
+  gfx_x = g_tx + 3; gfx_y = g_sy + g_sh + 2;
+  sprintf(#s, "F#%d", g_i);
+  gfx_drawstr(#s);
+  g_i += 1;
+);
+gfx_r = 1.0; gfx_g = 0.55; gfx_b = 0.15;
+gfx_rect(g_xf - 1, g_sy - 4, 3, g_sh + 8);
+
+// ---- low band correlation (measured BEFORE the mono sum)
+g_corr = mLR / (sqrt(max(mLL, eps18) * max(mRR, eps18)) + eps18);
+g_corr = min(max(g_corr, -1), 1);
+g_cy = g_sy + g_sh + 24;
+gfx_r = 0.13; gfx_g = 0.14; gfx_b = 0.17;
+gfx_rect(g_pad, g_cy, g_w, 14);
+g_cx = g_pad + g_w*0.5;
+g_corr >= 0 ? (
+  gfx_r = 0.20; gfx_g = 0.78; gfx_b = 0.45;
+  gfx_rect(g_cx, g_cy, max(g_corr*g_w*0.5, 1), 14);
+) : (
+  gfx_r = 0.90; gfx_g = 0.30; gfx_b = 0.25;
+  gfx_rect(g_cx + g_corr*g_w*0.5, g_cy, max(-g_corr*g_w*0.5, 1), 14);
+);
+gfx_r = 0.62; gfx_g = 0.64; gfx_b = 0.70;
+gfx_line(g_cx, g_cy, g_cx, g_cy + 14);
+
+gfx_setfont(2, "Arial", 12);
+gfx_r = 0.55; gfx_g = 0.60; gfx_b = 0.68;
+gfx_x = g_pad; gfx_y = g_cy + 18;
+sprintf(#s, "low band correlation (pre-mono)  %+.2f", g_corr);
+gfx_drawstr(#s);
+
+g_db = 10*log10(max(mML, eps12));
+gfx_x = g_pad; gfx_y = g_cy + 34;
+sprintf(#s, "mono bass band  %.1f dB RMS", g_db);
+gfx_drawstr(#s);

@@ -1,0 +1,218 @@
+desc:STRYK 16-Step Trance Gate (144 BPM / F# / A=432 pack)
+//tags: gate trance tremolo rhythm sequencer 16-step
+//author: STRYK 144 pack
+
+/* ---------------------------------------------------------------------------
+   STRYK 16-STEP TRANCE GATE
+   ---------------------------------------------------------------------------
+   The uplifting/tech-trance staple: a 16-step tempo-locked amplitude gate for
+   pads, chord stabs, supersaw beds and rolling atmospheres.
+
+   Session defaults this pack is built around:
+     144 BPM  -> beat 416.667 ms | 1/8 208.333 ms | 1/16 104.167 ms
+                 1 bar 4/4 = 1666.67 ms, so a 16-step 1/16 pattern = exactly 1 bar.
+     Key F#, A=432 Hz (-31.77 cents vs A=440). No pitch/tuning is touched by a
+     gate, so 432 is informational here - it just tells you which pack this is.
+     144 appears ONLY as the Free-run BPM default. While the transport rolls the
+     gate follows the host `tempo` and locks to `beat_position`, so it tracks any
+     project tempo and any tempo map.
+
+   Grid:
+     Step Division 1/8  -> 16 steps = 2 bars (4/4)
+     Step Division 1/16 -> 16 steps = 1 bar   <- default, classic trance gate
+     Step Division 1/32 -> 16 steps = 1/2 bar (rolling half-bar stutter)
+
+   Default pattern is a rolling offbeat 16th figure with a small end-of-bar
+   fill - drop it on a pad and it is instantly musical, no editing needed.
+   Step levels are continuous 0..1, not on/off, so ghost steps breathe.
+
+   Attack/Release are per-sample one-pole slews on the step target, so there
+   are no clicks even at 0-to-1 jumps. Depth sets the floor (100% = fully
+   closed on a 0 step), Mix blends the gated signal against the dry signal.
+   --------------------------------------------------------------------------- */
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+slider1:1.00<0,1,0.01>Step 01 Level
+slider2:0.00<0,1,0.01>Step 02 Level
+slider3:0.60<0,1,0.01>Step 03 Level
+slider4:0.00<0,1,0.01>Step 04 Level
+slider5:1.00<0,1,0.01>Step 05 Level
+slider6:0.00<0,1,0.01>Step 06 Level
+slider7:0.60<0,1,0.01>Step 07 Level
+slider8:0.25<0,1,0.01>Step 08 Level
+slider9:1.00<0,1,0.01>Step 09 Level
+slider10:0.00<0,1,0.01>Step 10 Level
+slider11:0.60<0,1,0.01>Step 11 Level
+slider12:0.00<0,1,0.01>Step 12 Level
+slider13:1.00<0,1,0.01>Step 13 Level
+slider14:0.30<0,1,0.01>Step 14 Level
+slider15:0.75<0,1,0.01>Step 15 Level
+slider16:0.45<0,1,0.01>Step 16 Level
+slider17:1<0,2,1{1/8,1/16,1/32}>Step Division (1/16 = 16 steps per bar)
+slider18:2<0.1,50,0.1>Attack (ms)
+slider19:25<1,200,1>Release (ms)
+slider20:100<0,100,1>Depth (%)
+slider21:100<0,100,1>Mix (dry/gated) (%)
+slider22:144<40,220,0.01>Free-run BPM (transport stopped)
+
+@init
+
+ext_nodenorm = 1;
+
+steps = 0;        // 16 step levels live at memory slots 0..15
+freembuf(16);
+
+// one-pole coefficient for a given time constant in milliseconds
+function ms2coef(ms) (
+  ms = max(ms, 0.01);
+  1 - exp(-1 / (ms * 0.001 * srate));
+);
+
+function update_params() (
+  steps[0]  = slider1;   steps[1]  = slider2;   steps[2]  = slider3;   steps[3]  = slider4;
+  steps[4]  = slider5;   steps[5]  = slider6;   steps[6]  = slider7;   steps[7]  = slider8;
+  steps[8]  = slider9;   steps[9]  = slider10;  steps[10] = slider11;  steps[11] = slider12;
+  steps[12] = slider13;  steps[13] = slider14;  steps[14] = slider15;  steps[15] = slider16;
+
+  div_sel = slider17 | 0;
+  // steps per quarter note
+  spb = div_sel == 0 ? 2 : (div_sel == 2 ? 8 : 4);
+
+  atk_c = ms2coef(slider18);
+  rel_c = ms2coef(slider19);
+
+  depth_t = min(max(slider20, 0), 100) * 0.01;
+  mix_t   = min(max(slider21, 0), 100) * 0.01;
+
+  free_bpm = max(slider22, 20);
+);
+
+// smoothing for Depth / Mix (~20 Hz) so nothing zippers
+sm_c = 1 - exp(-2 * $pi * 20 / max(srate, 1));
+
+update_params();
+
+env      = 0;
+step_pos = 0;
+depth_s  = depth_t;
+mix_s    = mix_t;
+cur_bpm  = free_bpm;
+inc      = cur_bpm * spb / (60 * max(srate, 1));
+tot      = 1;
+
+#lock    = "[grid-locked]";
+#freerun = "[free-run]";
+
+@slider
+
+update_params();
+
+@block
+
+play_state & 1 ? (
+  // transport rolling: hard-lock the phase to the project grid every block
+  bp = beat_position;
+  bp < 0 ? ( bp = 0; );
+  sp = bp * spb;
+  step_pos = sp - floor(sp / 16) * 16;
+  cur_bpm = tempo > 1 ? tempo : free_bpm;
+  inc = cur_bpm * spb / (60 * max(srate, 1));
+) : (
+  play_state & 2 ? (
+    // paused: freeze where we are
+    inc = 0;
+  ) : (
+    // stopped: free-run so it can be auditioned without the transport
+    cur_bpm = free_bpm;
+    inc = cur_bpm * spb / (60 * max(srate, 1));
+  );
+);
+
+@sample
+
+si = step_pos | 0;
+si < 0  ? ( si = 0;  );
+si > 15 ? ( si = 15; );
+
+tgt = steps[si];
+tgt = min(max(tgt, 0), 1);
+
+c = tgt > env ? atk_c : rel_c;
+env += c * (tgt - env);
+abs(env) < 0.000000000001 ? ( env = 0; );
+
+depth_s += sm_c * (depth_t - depth_s);
+mix_s   += sm_c * (mix_t   - mix_s);
+
+// depth: 0% = gate does nothing, 100% = a 0 step fully closes
+g = 1 - depth_s + depth_s * env;
+// mix: blend gated against dry
+tot = 1 - mix_s + mix_s * g;
+
+spl0 *= tot;
+spl1 *= tot;
+
+step_pos += inc;
+step_pos >= 16 ? ( step_pos -= 16; );
+step_pos <  0  ? ( step_pos  = 0;  );
+
+@gfx 460 150
+
+gfx_setfont(1, "Arial", 13);
+
+gfx_r = 0.07; gfx_g = 0.08; gfx_b = 0.10; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+pad = 10;
+top = 24;
+bh  = gfx_h - top - 34;
+bh < 10 ? ( bh = 10; );
+bw = (gfx_w - pad * 2) / 16;
+
+gcur = step_pos | 0;
+gcur < 0  ? ( gcur = 0;  );
+gcur > 15 ? ( gcur = 15; );
+
+i = 0;
+loop(16,
+  x  = pad + i * bw;
+  lv = min(max(steps[i], 0), 1);
+
+  // slot background, brighter on every downbeat group of 4
+  (i - floor(i / 4) * 4) == 0 ? (
+    gfx_r = 0.20; gfx_g = 0.21; gfx_b = 0.25;
+  ) : (
+    gfx_r = 0.14; gfx_g = 0.15; gfx_b = 0.18;
+  );
+  gfx_rect(x + 1, top, bw - 2, bh);
+
+  i == gcur ? (
+    gfx_r = 1.00; gfx_g = 0.58; gfx_b = 0.12;
+  ) : (
+    gfx_r = 0.22; gfx_g = 0.62; gfx_b = 1.00;
+  );
+  bhh = lv * bh;
+  bhh > 1 ? ( gfx_rect(x + 1, top + bh - bhh, bw - 2, bhh); );
+
+  i += 1;
+);
+
+// live gate envelope meter along the bottom of the step area
+gfx_r = 0.95; gfx_g = 0.95; gfx_b = 0.95; gfx_a = 0.85;
+gfx_rect(pad, top + bh + 4, (gfx_w - pad * 2) * min(max(env, 0), 1), 4);
+gfx_a = 1;
+
+gfx_r = 0.85; gfx_g = 0.87; gfx_b = 0.90;
+gfx_x = pad; gfx_y = 5;
+sprintf(#s, "STRYK Trance Gate   1/%d   %.2f BPM   ", spb * 4, cur_bpm);
+gfx_drawstr(#s);
+play_state & 1 ? ( gfx_drawstr(#lock); ) : ( gfx_drawstr(#freerun); );
+
+gfx_x = pad; gfx_y = gfx_h - 20;
+sprintf(#s, "step %d/16   gain %.0f%%   depth %.0f%%   mix %.0f%%",
+        gcur + 1, tot * 100, depth_s * 100, mix_s * 100);
+gfx_drawstr(#s);

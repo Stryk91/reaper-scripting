@@ -1,0 +1,481 @@
+desc:STRYK Tuner 432
+//tags: analysis pitch tuner tuning meter utility
+//author: STRYK 144 pack
+
+/* ==================================================================
+   STRYK TUNER 432  --  A=432 reference tuner, audio pass-through
+   ------------------------------------------------------------------
+   Drop it on anything recorded, resampled or bounced and check that
+   it actually landed in the new tuning. spl0/spl1 are READ ONLY --
+   audio goes straight through, bit for bit.
+
+   Session defaults (144 BPM / F# / A=432):
+     * Reference A defaults to 432.00 Hz.
+       440 -> 432 is 12*log2(432/440) = -31.77 cents, so anything
+       cut against A=440 reads about -31.8 c flat here. That number
+       is printed in the header so the offset is always visible.
+     * F# is the session key -> a detected F# lights up violet and
+       the footer prints F#4 at the current reference.
+       F# at A=432: F#0 22.70  F#1 45.41  F#2 90.82  F#3 181.63
+                    F#4 363.27 F#5 726.54 F#6 1453.08 F#7 2906.16
+       freq(note) = ref * 2^((note-69)/12);  F#4 = MIDI 66.
+     * Nothing here is time-synced, so 144 BPM is never baked in.
+       The footer just reports the live host tempo for reference.
+
+   Detection: YIN-style autocorrelation (cumulative mean normalised
+   difference function) on a 4x one-pole low-passed + decimated copy
+   (~4.8 kHz analysis rate) to find the coarse period cheaply, then a
+   narrow full-samplerate difference-function search around that lag
+   with parabolic interpolation -> roughly 1 cent resolution even up
+   at F#6. Frequency is smoothed in the log domain so the readout is
+   steady but still snaps instantly when the note changes.
+   ================================================================== */
+
+slider1:432<400,460,0.01>Reference A (Hz)
+slider2:-40<-60,-10,0.5>Sensitivity Gate (dB RMS)
+slider3:0.7<0,1,0.01>Smoothing (0 = snappy, 1 = slow)
+slider4:55<30,300,1>Lowest Note Detected (Hz)
+slider5:1200<300,2000,10>Highest Note Detected (Hz)
+slider6:2<0,2,1{Left,Right,Mono Sum (L+R)}>Analysis Input
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+@init
+ext_nodenorm = 1;
+LN2 = log(2);
+
+FBUFSZ = 32768; FMASK = FBUFSZ - 1;   // full rate circular buffer
+DBUFSZ = 4096;  DMASK = DBUFSZ - 1;   // decimated circular buffer
+
+fbuf = 0;
+dbuf = fbuf + FBUFSZ;
+yd   = dbuf + DBUFSZ;    // difference function            (1024)
+ycm  = yd + 1024;        // cumulative mean normalised d'  (1024)
+fd   = ycm + 1024;       // full rate refine scratch       (1024)
+tks  = fd + 1024;        // needle scale tick values       (16)
+freembuf(tks + 16);
+
+memset(fbuf, 0, FBUFSZ);
+memset(dbuf, 0, DBUFSZ);
+memset(yd,   0, 1024);
+memset(ycm,  0, 1024);
+memset(fd,   0, 1024);
+
+tks[0] = -50; tks[1] = -15; tks[2] = -5; tks[3] = 0;
+tks[4] = 5;   tks[5] = 15;  tks[6] = 50;
+
+HOP = 256;   // decimated samples between analyses (~53 ms @ 4.8 kHz)
+
+// ---------------------------------------------------------------
+// derive every coefficient / window size from srate + sliders
+// ---------------------------------------------------------------
+function tuner_setup()
+(
+  DEC = max(1, floor(srate/4800));
+  DEC = min(DEC, 64);
+  dsrate = srate/DEC;
+
+  // 4 cascaded one-poles as the decimation anti-alias filter
+  aacut = min(1800, dsrate*0.40);
+  aac   = 1 - exp(-2*$pi*aacut/max(srate,1));
+
+  dcr = max(0, 1 - 2*$pi*8/max(srate,1));    // ~8 Hz DC blocker
+  lvc = 1 - exp(-2*$pi*8/max(srate,1));      // ~20 ms level follower
+
+  refhz   = min(max(slider1, 300), 700);
+  gatedb  = slider2;
+  gatelin = pow(10, gatedb/20);
+  smoo    = min(max(slider3, 0), 1);
+  alp     = smoo*0.95;                       // per-frame smoothing pole
+
+  fmin = min(max(slider4, 20), 300);
+  fmax = min(max(slider5, 300), 4000);
+  fmax = min(fmax, dsrate*0.40);
+  fmax = max(fmax, fmin*2);
+
+  maxlag = min(900, ceil(dsrate/fmin));
+  minlag = max(2, floor(dsrate/fmax));
+  minlag >= maxlag - 2 ? ( minlag = max(2, maxlag - 3); );
+
+  winn = min(1024, max(512, 2*maxlag));
+  (winn + maxlag + 8) > DBUFSZ ? ( winn = DBUFSZ - maxlag - 8; );
+
+  // full rate refine window, cost-capped so 96/192k stays sane
+  nfull = min(8192, max(512, floor(srate*0.06)));
+  nfull = min(nfull, max(512, floor(250000/(2*DEC + 8))));
+  maxlagf = min(FBUFSZ - nfull - 16, ceil(srate/fmin) + DEC + 8);
+
+  srcsel = slider6|0;
+);
+
+// ---------------------------------------------------------------
+// coarse YIN on the decimated copy + full rate parabolic refine
+// ---------------------------------------------------------------
+function tuner_analyze()
+  local(i, t, s, dd, st, run, bt, bv, y0, y1, y2, den, sh,
+        tds, fcz, cfz, lo, hi, idx, ff, lf, cmv)
+(
+  // ---- difference function d(tau) over one fixed window ----------
+  st = (dpos - (winn + maxlag) + DBUFSZ*2) & DMASK;
+  t = 1;
+  while (t <= maxlag) (
+    s = 0; i = 0;
+    while (i < winn) (
+      dd = dbuf[(st + i) & DMASK] - dbuf[(st + i + t) & DMASK];
+      s += dd*dd;
+      i += 1;
+    );
+    yd[t] = s;
+    t += 1;
+  );
+
+  // ---- cumulative mean normalised difference ---------------------
+  ycm[0] = 1; run = 0; t = 1;
+  while (t <= maxlag) (
+    run += yd[t];
+    ycm[t] = run > 0.000000000001 ? yd[t]*t/run : 1;
+    t += 1;
+  );
+
+  // ---- absolute threshold, else global minimum -------------------
+  bt = 0; t = minlag;
+  while (t < maxlag && bt == 0) (
+    ycm[t] < 0.15 ? (
+      while (t < maxlag && ycm[t+1] < ycm[t]) ( t += 1; );
+      bt = t;
+    ) : (
+      t += 1;
+    );
+  );
+  bt == 0 ? (
+    bv = 1000000000000; t = minlag;
+    while (t <= maxlag) (
+      ycm[t] < bv ? ( bv = ycm[t]; bt = t; );
+      t += 1;
+    );
+  );
+
+  cmv = bt >= 1 ? ycm[bt] : 1;
+  havepitch = 0;
+
+  (bt >= 2 && bt >= minlag && bt <= maxlag - 1 && cmv < 0.62 && gateopen) ? (
+    // parabolic interpolation on the coarse minimum
+    y0 = ycm[bt-1]; y1 = ycm[bt]; y2 = ycm[bt+1];
+    den = y0 - 2*y1 + y2;
+    sh = abs(den) > 0.000000000001 ? 0.5*(y0 - y2)/den : 0;
+    abs(sh) > 1 ? ( sh = 0; );
+    tds = bt + sh;
+    fcz = tds > 0.5 ? dsrate/tds : 0;
+
+    // ---- full samplerate refinement around that lag --------------
+    fcz > 0 ? (
+      cfz = tds*DEC;
+      lo = floor(cfz) - (DEC + 2);
+      hi = ceil(cfz)  + (DEC + 2);
+      lo < 2 ? ( lo = 2; );
+      hi > maxlagf ? ( hi = maxlagf; );
+      (hi - lo) >= 2 ? (
+        st = (fpos - (nfull + hi) + FBUFSZ*2) & FMASK;
+        t = lo;
+        while (t <= hi) (
+          s = 0; i = 0;
+          while (i < nfull) (
+            dd = fbuf[(st + i) & FMASK] - fbuf[(st + i + t) & FMASK];
+            s += dd*dd;
+            i += 1;
+          );
+          fd[t - lo] = s;
+          t += 1;
+        );
+        bv = fd[0]; idx = 0; i = 1;
+        while (i <= hi - lo) (
+          fd[i] < bv ? ( bv = fd[i]; idx = i; );
+          i += 1;
+        );
+        (idx > 0 && idx < (hi - lo)) ? (
+          y0 = fd[idx-1]; y1 = fd[idx]; y2 = fd[idx+1];
+          den = y0 - 2*y1 + y2;
+          sh = abs(den) > 0.000000000001 ? 0.5*(y0 - y2)/den : 0;
+          abs(sh) > 1 ? ( sh = 0; );
+        ) : (
+          sh = 0;
+        );
+        ff = lo + idx + sh;
+        // The refine window is only +/-(DEC+2) full rate samples wide, so an
+        // octave error cannot live inside it -- accept anything the window
+        // itself produced. A percentage tolerance would throw away perfectly
+        // good refinements up high: at 1.2 kHz / 44.1k the coarse lag is only
+        // ~37 samples and its own quantisation error is already +/-DEC/2.
+        (ff > 1 && abs(ff - cfz) <= DEC + 3) ? ( fcz = srate/ff; );
+      );
+    );
+
+    // ---- accept + log-domain smoothing ---------------------------
+    (fcz > 15 && fcz < srate*0.45) ? (
+      lf = log(fcz);
+      lfinit ? (
+        abs(lf - lfsm) > 0.058 ? ( lfsm = lf; ) : ( lfsm = lfsm*alp + lf*(1 - alp); );
+      ) : (
+        lfsm = lf; lfinit = 1;
+      );
+      detf = exp(lfsm);
+      detconf = min(max(1 - cmv, 0), 1);
+      havepitch = 1;
+    );
+  );
+);
+
+// ---- running state ---------------------------------------------
+lp1 = lp2 = lp3 = lp4 = 0;
+dcx1 = dcy1 = 0;
+lvl = 0; dn = 0.000000000000000001;
+fpos = dpos = dcnt = hopcnt = fcount = 0;
+detf = 0; detconf = 0; havepitch = 0;
+lfsm = 0; lfinit = 0; losttime = 0;
+cents = 0; pc = 0; octv = 0; nearest = 0; tgtf = 0; isfs = 0;
+sigdb = -120; gateopen = 0; hosttempo = 120;
+
+tuner_setup();
+
+@slider
+tuner_setup();
+
+@block
+hosttempo = tempo;
+sig = sqrt(max(lvl, 0));
+sigdb = 20*log10(max(sig, 0.000000001));
+gateopen = sig >= gatelin ? 1 : 0;
+
+hopcnt >= HOP ? (
+  hopcnt = 0;
+  (fcount > nfull + maxlagf + 8 && fcount > (winn + maxlag + 8)*DEC) ? ( tuner_analyze(); );
+);
+
+havepitch ? (
+  losttime = 0;
+) : (
+  losttime += samplesblock/max(srate, 1);
+  losttime > 1.2 ? ( lfinit = 0; detf = 0; );
+);
+
+detf > 0 ? (
+  midiv   = 69 + 12*log(detf/refhz)/LN2;
+  nearest = floor(midiv + 0.5);
+  cents   = (midiv - nearest)*100;
+  pc      = nearest - floor(nearest/12)*12;
+  octv    = floor(nearest/12) - 1;
+  tgtf    = refhz*pow(2, (nearest - 69)/12);
+  isfs    = pc == 6 ? 1 : 0;
+) : (
+  isfs = 0;
+);
+
+@sample
+// analysis tap only -- spl0/spl1 are never written, audio passes through
+x = num_ch < 2 ? spl0 : (srcsel == 0 ? spl0 : srcsel == 1 ? spl1 : (spl0 + spl1)*0.5);
+x += dn; dn = -dn;                       // anti-denormal dither
+
+dcy1 = x - dcx1 + dcr*dcy1;              // DC block
+dcx1 = x;
+xd = dcy1;
+
+lvl += lvc*(xd*xd - lvl);                // mean-square follower
+
+fbuf[fpos] = xd;
+fpos = (fpos + 1) & FMASK;
+
+lp1 += aac*(xd  - lp1);                  // 4x one-pole anti-alias
+lp2 += aac*(lp1 - lp2);
+lp3 += aac*(lp2 - lp3);
+lp4 += aac*(lp3 - lp4);
+
+dcnt += 1;
+dcnt >= DEC ? (
+  dcnt = 0;
+  dbuf[dpos] = lp4;
+  dpos = (dpos + 1) & DMASK;
+  hopcnt += 1;
+);
+fcount < 1000000000 ? ( fcount += 1; );
+
+@gfx 480 300
+gw = gfx_w; gh = gfx_h;
+gfx_set(0.055, 0.065, 0.085, 1);
+gfx_rect(0, 0, gw, gh);
+
+fbig = max(20, floor(gh*0.24));
+fmed = max(12, floor(gh*0.085));
+fsml = max(9,  floor(gh*0.052));
+
+live = (detf > 0 && gateopen) ? 1 : 0;
+ac = abs(cents);
+live ? (
+  ac <= 5  ? ( cr = 0.20; cg = 0.90; cb = 0.45; ) :
+  ac <= 15 ? ( cr = 1.00; cg = 0.74; cb = 0.18; ) :
+             ( cr = 1.00; cg = 0.32; cb = 0.28; );
+) : (
+  cr = 0.34; cg = 0.37; cb = 0.44;
+);
+
+// ---------------- header ----------------
+gfx_setfont(3, "Arial", fsml);
+gfx_set(0.40, 0.45, 0.53, 1);
+gfx_x = gw*0.035; gfx_y = gh*0.030;
+gfx_drawstr("REF A");
+gfx_set(0.78, 0.83, 0.92, 1);
+off440 = 1200*log(refhz/440)/LN2;
+sprintf(#s1, "%.2f Hz   ( %.1f cents vs A=440 )", refhz, off440);
+gfx_x += 6;
+gfx_drawstr(#s1);
+
+sprintf(#s2, "IN %.1f dB", max(sigdb, -99));
+gfx_setfont(3, "Arial", fsml);
+gfx_measurestr(#s2, tw, th);
+gateopen ? gfx_set(0.45, 0.85, 0.65, 1) : gfx_set(0.42, 0.44, 0.50, 1);
+gfx_x = gw*0.965 - tw; gfx_y = gh*0.030;
+gfx_drawstr(#s2);
+
+mx0 = gw*0.70; mw = gw*0.965 - mx0; my = gh*0.030 + fsml + 5;
+gfx_set(0.13, 0.15, 0.18, 1);
+gfx_rect(mx0, my, mw, 3);
+lvn = min(max((sigdb + 60)/60, 0), 1);
+gateopen ? gfx_set(0.30, 0.80, 0.55, 1) : gfx_set(0.38, 0.40, 0.46, 1);
+gfx_rect(mx0, my, mw*lvn, 3);
+gtn = min(max((gatedb + 60)/60, 0), 1);
+gfx_set(0.95, 0.75, 0.25, 1);
+gfx_rect(mx0 + mw*gtn - 1, my - 2, 2, 7);
+
+// ---------------- note name ----------------
+live ? (
+  pc == 0  ? ( strcpy(#nm, "C");  ) :
+  pc == 1  ? ( strcpy(#nm, "C#"); ) :
+  pc == 2  ? ( strcpy(#nm, "D");  ) :
+  pc == 3  ? ( strcpy(#nm, "D#"); ) :
+  pc == 4  ? ( strcpy(#nm, "E");  ) :
+  pc == 5  ? ( strcpy(#nm, "F");  ) :
+  pc == 6  ? ( strcpy(#nm, "F#"); ) :
+  pc == 7  ? ( strcpy(#nm, "G");  ) :
+  pc == 8  ? ( strcpy(#nm, "G#"); ) :
+  pc == 9  ? ( strcpy(#nm, "A");  ) :
+  pc == 10 ? ( strcpy(#nm, "A#"); ) : ( strcpy(#nm, "B"); );
+  sprintf(#oc, "%d", octv);
+) : (
+  strcpy(#nm, "--");
+  strcpy(#oc, "");
+);
+
+gfx_setfont(1, "Arial", fbig, 'b');
+gfx_measurestr(#nm, w1, th); h1 = gfx_texth;
+gfx_setfont(2, "Arial", fmed, 'b');
+gfx_measurestr(#oc, w2, th); h2 = gfx_texth;
+tot = w1 + w2 + 3;
+nx = gw*0.5 - tot*0.5;
+ny = gh*0.155;
+
+(live && isfs) ? (
+  gfx_set(0.62, 0.42, 1.00, 0.16);
+  gfx_rect(nx - 16, ny - 6, tot + 32, h1 + 12);
+  gfx_set(0.74, 0.58, 1.00, 1);
+  gfx_setfont(4, "Arial", fsml, 'b');
+  strcpy(#kk, "SESSION KEY  F#");
+  gfx_measurestr(#kk, tw, th);
+  gfx_x = gw*0.5 - tw*0.5; gfx_y = ny - fsml - 5;
+  gfx_drawstr(#kk);
+);
+
+gfx_setfont(1, "Arial", fbig, 'b');
+live ? gfx_set(0.93, 0.95, 1.00, 1) : gfx_set(0.33, 0.36, 0.42, 1);
+gfx_x = nx; gfx_y = ny;
+gfx_drawstr(#nm);
+gfx_setfont(2, "Arial", fmed, 'b');
+live ? gfx_set(0.55, 0.61, 0.72, 1);
+gfx_x = nx + w1 + 3; gfx_y = ny + h1 - h2 - h1*0.10;
+gfx_drawstr(#oc);
+
+// ---------------- cents readout ----------------
+live ? (
+  sprintf(#ct, "%.1f cents", cents);
+  cents >= 0 ? ( strcpy(#tmp, "+"); strcat(#tmp, #ct); strcpy(#ct, #tmp); );
+) : (
+  strcpy(#ct, "-- no signal --");
+);
+gfx_setfont(2, "Arial", fmed, 'b');
+gfx_measurestr(#ct, tw, th);
+gfx_set(cr, cg, cb, 1);
+gfx_x = gw*0.5 - tw*0.5; gfx_y = gh*0.440;
+gfx_drawstr(#ct);
+
+// ---------------- needle ----------------
+bx0 = gw*0.06; bx1 = gw*0.94; bwd = bx1 - bx0; bcx = (bx0 + bx1)*0.5;
+byy = gh*0.575; bht = gh*0.085;
+
+gfx_set(0.12, 0.135, 0.165, 1);
+gfx_rect(bx0, byy, bwd, bht);
+gfx_set(1.00, 0.74, 0.18, 0.10);
+gfx_rect(bcx - 15*bwd/100, byy, 30*bwd/100, bht);
+gfx_set(0.20, 0.90, 0.45, 0.14);
+gfx_rect(bcx - 5*bwd/100, byy, 10*bwd/100, bht);
+
+gfx_setfont(3, "Arial", fsml);
+i = 0;
+while (i < 7) (
+  tv = tks[i];
+  tx = bcx + tv*bwd/100;
+  gfx_set(0.33, 0.36, 0.43, 1);
+  gfx_rect(tx, byy - 3, 1, bht + 6);
+  sprintf(#tmp, "%d", tv);
+  gfx_measurestr(#tmp, tw, th);
+  gfx_set(0.40, 0.44, 0.52, 1);
+  gfx_x = tx - tw*0.5; gfx_y = byy + bht + 5;
+  gfx_drawstr(#tmp);
+  i += 1;
+);
+
+gfx_set(0.72, 0.77, 0.86, 0.85);
+gfx_rect(bcx - 1, byy - 6, 2, bht + 12);
+
+live ? (
+  cc = min(max(cents, -50), 50);
+  nxp = bcx + cc*bwd/100;
+  gfx_set(cr, cg, cb, 0.28);
+  gfx_rect(min(nxp, bcx), byy + bht*0.30, abs(nxp - bcx), bht*0.40);
+  gfx_set(cr, cg, cb, 1);
+  gfx_rect(nxp - 2, byy - 6, 5, bht + 12);
+) : (
+  gfx_set(0.28, 0.30, 0.36, 1);
+  gfx_rect(bcx - 2, byy - 6, 5, bht + 12);
+);
+
+// ---------------- readout cells ----------------
+c1 = gw*0.20; c2 = gw*0.50; c3 = gw*0.80;
+lyl = gh*0.775; lyv = gh*0.835;
+
+gfx_setfont(3, "Arial", fsml);
+gfx_set(0.38, 0.43, 0.51, 1);
+strcpy(#tmp, "DETECTED");  gfx_measurestr(#tmp, tw, th); gfx_x = c1 - tw*0.5; gfx_y = lyl; gfx_drawstr(#tmp);
+strcpy(#tmp, "TARGET");    gfx_measurestr(#tmp, tw, th); gfx_x = c2 - tw*0.5; gfx_y = lyl; gfx_drawstr(#tmp);
+strcpy(#tmp, "STABILITY"); gfx_measurestr(#tmp, tw, th); gfx_x = c3 - tw*0.5; gfx_y = lyl; gfx_drawstr(#tmp);
+
+gfx_setfont(2, "Arial", fmed, 'b');
+live ? gfx_set(0.86, 0.90, 0.97, 1) : gfx_set(0.31, 0.34, 0.40, 1);
+live ? ( sprintf(#tmp, "%.2f Hz", detf); ) : ( strcpy(#tmp, "--"); );
+gfx_measurestr(#tmp, tw, th); gfx_x = c1 - tw*0.5; gfx_y = lyv; gfx_drawstr(#tmp);
+live ? ( sprintf(#tmp, "%.2f Hz", tgtf); ) : ( strcpy(#tmp, "--"); );
+gfx_measurestr(#tmp, tw, th); gfx_x = c2 - tw*0.5; gfx_y = lyv; gfx_drawstr(#tmp);
+live ? ( sprintf(#tmp, "%d", floor(detconf*100 + 0.5)); strcat(#tmp, "%"); ) : ( strcpy(#tmp, "--"); );
+gfx_measurestr(#tmp, tw, th); gfx_x = c3 - tw*0.5; gfx_y = lyv; gfx_drawstr(#tmp);
+
+// ---------------- footer ----------------
+gfx_setfont(3, "Arial", fsml);
+gfx_set(0.34, 0.38, 0.46, 1);
+fsh = refhz*pow(2, -3/12);
+sprintf(#tmp, "F#4 = %.2f Hz at this reference", fsh);
+gfx_x = gw*0.035; gfx_y = gh*0.945;
+gfx_drawstr(#tmp);
+sprintf(#tmp, "HOST %.1f BPM", hosttempo);
+gfx_measurestr(#tmp, tw, th);
+gfx_x = gw*0.965 - tw; gfx_y = gh*0.945;
+gfx_drawstr(#tmp);

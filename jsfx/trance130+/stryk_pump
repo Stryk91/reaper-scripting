@@ -1,0 +1,282 @@
+desc:STRYK Pump - tempo-locked sidechain ducker (144 / F#m / A=432 pack)
+//tags: dynamics sidechain ducker pump trance tempo-sync
+//author: STRYK 144 pack
+
+/* ----------------------------------------------------------------------------
+   STRYK Pump
+   ----------------------------------------------------------------------------
+   The trance pump, with no kick send and no compressor to set up. The gain
+   envelope is generated from the host beat_position, so EVERY instance in the
+   project sits on the same grid - phase locked to the bar, never free running
+   against it. Pads, bass, plucks, reverb returns, the whole mix bus: they all
+   breathe on exactly the same beat.
+
+   Session defaults baked in (144 BPM, F# minor, A=432 Hz):
+     Rate     1/4 (one beat) = 416.667 ms at 144 BPM.
+              The other choices at 144: 1/1 bar 1666.67 | 1/2 833.33 |
+              1/8 208.333 | 1/4 triplet 277.78 ms.
+     Depth    70 %  -> floor sits at -10.5 dB. Deep enough to feel, not a gate.
+     Curve    0.35  -> mostly sharp exponential recovery with a touch of
+                       cosine softness: the classic uplifting swell back in.
+     Attack   1 ms  -> effectively instant duck, but no click on the edge.
+     Hold     0 ms
+     Phase    0 beats (the duck lands on the downbeat)
+     Mix      100 %
+     FreeBPM  144   -> used ONLY while the transport is stopped.
+
+   Tempo always comes from the host (tempo) while playing, so the pump follows
+   the project BPM and any tempo automation. The 144 above is only the default
+   for the stopped / free-run case and for the labels - nothing is hardcoded.
+   A=432 tuning (F# = 22.70 / 45.41 / 90.82 / 181.63 / 363.27 / 726.54 /
+   1453.08 / 2906.16 Hz) does not affect a gain effect; noted so the pack stays
+   consistent with the rest of the session.
+
+   Envelope shape, per cycle:
+     0 .. Attack        raised-cosine dip from unity down to the floor
+     Attack .. +Hold    sit on the floor
+     rest of the cycle  recover to unity, blended between
+                        exponential (Curve 0) and cosine (Curve 1)
+
+   Two normalised lookup tables do the work: the attack shape is fixed and is
+   built once, the recovery shape is rebuilt only when Curve moves. Nothing
+   transcendental runs per sample, and changing tempo / attack / hold costs
+   nothing at all.
+---------------------------------------------------------------------------- */
+
+slider1:2<0,4,1{1/1 bar (1666.7 ms at 144),1/2 (833.3 ms),1/4 beat (416.7 ms),1/8 (208.3 ms),1/4 triplet (277.8 ms)}>Rate
+slider2:70<0,100,0.1>Depth (%)
+slider3:0.35<0,1,0.01>Curve (0 sharp exp - 1 soft cosine)
+slider4:1<0,50,0.01>Attack (ms)
+slider5:0<0,200,0.1>Hold (ms)
+slider6:0<-1,1,0.001>Phase Offset (beats)
+slider7:100<0,100,0.1>Mix (%)
+slider8:144<40,300,0.01>Free-run BPM (transport stopped)
+
+@init
+
+ext_nodenorm = 1;
+
+LUTN   = 1024;              // points per normalised curve
+ATK    = 0;                 // attack shape table   : LUTN+1 doubles
+REL    = 2048;              // recovery shape table : LUTN+1 doubles
+INVEXP = 1 / (1 - exp(-5.5));
+freembuf(REL + LUTN + 8);
+
+TINY = 0.000000001;
+
+// -------------------------------------------------------- table lookup (lerp)
+function lut(base, u) local(x, i, f)
+(
+  u = min(max(u, 0), 1);
+  x = u * LUTN;
+  i = min(max(x | 0, 0), LUTN - 1);
+  f = x - i;
+  base[i] + f * (base[i + 1] - base[i])
+);
+
+// ------------------------------------- fixed attack curve: 0 = unity, 1 = duck
+function build_attack() local(i, u)
+(
+  i = 0;
+  loop(LUTN + 1,
+    u = i / LUTN;
+    ATK[i] = 0.5 - 0.5 * cos($pi * u);
+    i += 1;
+  );
+);
+
+// ------------- recovery curve: 0 = still fully ducked, 1 = back at unity.
+// Curve 0 = exponential (snaps up then eases in), Curve 1 = raised cosine.
+function build_release() local(i, u, ec, cc)
+(
+  i = 0;
+  loop(LUTN + 1,
+    u  = i / LUTN;
+    ec = (1 - exp(-5.5 * u)) * INVEXP;
+    cc = 0.5 - 0.5 * cos($pi * u);
+    REL[i] = shape_c * cc + (1 - shape_c) * ec;
+    i += 1;
+  );
+);
+
+// ------------------------- duck amount at a cycle phase: 0 = open, 1 = ducked
+function duck_at(ph) local(t)
+(
+  ph = ph - floor(ph);
+  t  = ph * per_sec;
+  t < atk_s ? (
+    lut(ATK, t * inv_atk)
+  ) : (
+    t < hold_end ? (
+      1
+    ) : (
+      1 - lut(REL, (t - hold_end) * inv_rel)
+    )
+  )
+);
+
+// ------------------------------------------------------------ slider decoding
+function read_sliders()
+(
+  slider1 < 0.5 ? ( period_beats = 4; ) :             // 1/1 = 4 quarter notes
+  ( slider1 < 1.5 ? ( period_beats = 2; ) :           // 1/2
+  ( slider1 < 2.5 ? ( period_beats = 1; ) :           // 1/4  (default)
+  ( slider1 < 3.5 ? ( period_beats = 0.5; ) :         // 1/8
+                    ( period_beats = 2/3; ) ) ) );    // 1/4 triplet
+
+  dep_t     = min(max(slider2, 0), 100) * 0.01;
+  shape_t   = min(max(slider3, 0), 1);
+  atk_ms    = min(max(slider4, 0), 50);
+  hold_ms   = min(max(slider5, 0), 200);
+  phase_off = min(max(slider6, -8), 8);
+  mix_t     = min(max(slider7, 0), 100) * 0.01;
+  free_bpm  = min(max(slider8, 20), 999);
+);
+
+// --------------------------------------------------- cycle + stage timing
+function recalc() local(tot, room, sc, bpmv)
+(
+  play_state & 1 ? ( bpmv = tempo; ) : ( bpmv = free_bpm; );
+  bpmv > 0 ? 0 : ( bpmv = free_bpm; );         // host reported nothing usable
+  bpmv = min(max(bpmv, 20), 999);
+  bpm_now = bpmv;
+
+  per_sec   = max(period_beats * 60 / bpmv, 0.002);
+  phase_inc = 1 / max(per_sec * srate, 1);
+
+  atk_s  = atk_ms  * 0.001;
+  hold_s = hold_ms * 0.001;
+  // attack + hold can never eat the whole cycle - always leave room to recover
+  tot  = atk_s + hold_s;
+  room = per_sec * 0.9;
+  tot > room ? (
+    sc     = room / max(tot, TINY);
+    atk_s  = atk_s  * sc;
+    hold_s = hold_s * sc;
+  );
+  hold_end = atk_s + hold_s;
+  rel_s    = max(per_sec - hold_end, 0.0001);
+
+  inv_atk = 1 / max(atk_s, TINY);
+  inv_rel = 1 / rel_s;
+);
+
+// ------------------------------------------------------------------ boot state
+phase   = 0;
+bpm_now = 144;
+
+read_sliders();
+dep_c   = dep_t;
+mix_c   = mix_t;
+shape_c = shape_t;
+shape_b = -1;
+
+build_attack();
+build_release();
+shape_b = shape_c;
+
+// ~5 ms one-pole so Depth / Mix moves never zipper
+sm_c = 1 - exp(-2 * $pi * 30 / max(srate, 1));
+
+recalc();
+
+@slider
+
+read_sliders();
+recalc();
+
+@block
+
+// Curve glides at block rate (it lives inside a table); rebuild only on change.
+shape_c = shape_c + 0.25 * (shape_t - shape_c);
+abs(shape_c - shape_t) < 0.0005 ? ( shape_c = shape_t; );
+shape_c != shape_b ? ( build_release(); shape_b = shape_c; );
+
+recalc();
+
+// Grid lock: while the transport rolls, take the phase straight from
+// beat_position (quarter notes) so every instance agrees where "1" is.
+// Stopped: leave phase alone and let @sample free-run it at Free-run BPM.
+play_state & 1 ? (
+  bp_e  = beat_position - phase_off;
+  ph_b  = bp_e / max(period_beats, 0.0001);
+  phase = ph_b - floor(ph_b);
+);
+
+@sample
+
+// smooth the two controls that touch gain
+dep_c = dep_c + sm_c * (dep_t - dep_c);
+mix_c = mix_c + sm_c * (mix_t - mix_c);
+abs(dep_t - dep_c) < 0.0000001 ? ( dep_c = dep_t; );  // snap, kills denormals
+abs(mix_t - mix_c) < 0.0000001 ? ( mix_c = mix_t; );
+
+// gain = 1 - mix * depth * duck
+// (a dry/wet blend on a pure gain folds exactly into the gain, no extra path)
+g_now = 1 - dep_c * mix_c * duck_at(phase);
+g_now = min(max(g_now, 0), 1);
+
+spl0 = spl0 * g_now;
+spl1 = spl1 * g_now;
+num_ch > 2 ? (
+  ch_i = 2;
+  loop(num_ch - 2,
+    spl(ch_i) = spl(ch_i) * g_now;
+    ch_i += 1;
+  );
+);
+
+phase = phase + phase_inc;
+phase >= 1 ? ( phase = phase - floor(phase); );
+
+@gfx 480 190
+
+gfx_setfont(1, "Arial", 14);
+
+gfx_r = 0.06; gfx_g = 0.07; gfx_b = 0.09; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+px0  = 10;
+py0  = 42;
+pw   = max(gfx_w - 20, 8);
+ph_h = max(gfx_h - 64, 8);
+
+gfx_r = 0.12; gfx_g = 0.13; gfx_b = 0.16;
+gfx_rect(px0, py0, pw, ph_h);
+
+// unity line + the divider between the two displayed cycles
+gfx_r = 0.30; gfx_g = 0.32; gfx_b = 0.36;
+gfx_line(px0, py0, px0 + pw, py0);
+gfx_line(px0 + pw * 0.5, py0, px0 + pw * 0.5, py0 + ph_h);
+
+// the envelope, drawn over two cycles
+gfx_r = 0.25; gfx_g = 0.85; gfx_b = 1.0;
+gx = 0; lx = -1; ly = 0;
+loop(pw,
+  gv = 1 - dep_c * mix_c * duck_at((gx / pw) * 2);
+  gy = py0 + (1 - min(max(gv, 0), 1)) * ph_h;
+  lx >= 0 ? ( gfx_line(lx, ly, px0 + gx, gy); );
+  lx = px0 + gx; ly = gy;
+  gx += 1;
+);
+
+// playhead
+gfx_r = 1.0; gfx_g = 0.55; gfx_b = 0.15;
+hx = px0 + (phase - floor(phase)) * pw * 0.5;
+gfx_line(hx, py0, hx, py0 + ph_h);
+
+// readout
+flr = 20 * log10(max(1 - dep_c * mix_c, 0.000016));
+gfx_r = 0.86; gfx_g = 0.89; gfx_b = 0.93;
+gfx_x = px0; gfx_y = 8;
+sprintf(#s, "cycle %.1f ms    %.2f BPM    floor %.1f dB", per_sec * 1000, bpm_now, flr);
+gfx_drawstr(#s);
+
+gfx_r = 0.55; gfx_g = 0.60; gfx_b = 0.66;
+gfx_x = px0; gfx_y = 24;
+play_state & 1 ? (
+  sprintf(#s, "GRID LOCKED to beat_position    offset %.3f beats", phase_off);
+) : (
+  sprintf(#s, "FREE RUN at %.2f BPM (transport stopped)", free_bpm);
+);
+gfx_drawstr(#s);

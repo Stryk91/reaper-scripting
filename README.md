@@ -1,8 +1,8 @@
 # reaper-scripting
 
-Version control and a test harness for the ReaScript work across `G:\pipelines`.
+Everything REAPER: ReaScripts, JSFX, FX chains, and a test harness for them.
 
-REAPER loads scripts from `%APPDATA%\REAPER\Scripts\`, which lives on `C:\` — and `C:\`
+REAPER loads all of it from `%APPDATA%\REAPER\`, which lives on `C:\` — and `C:\`
 has already been wiped once (the 2026-08-01 reinstall). Anything that exists only there
 is one boot failure from gone. This repo is the source of truth; `install.ps1` pushes
 copies into REAPER.
@@ -11,13 +11,50 @@ copies into REAPER.
 
 | Path | What |
 | --- | --- |
-| `scripts/` | The ReaScripts themselves. Source of truth. |
+| `scripts/` | ReaScripts. Genre-agnostic tooling — load these as actions. |
+| `jsfx/<genre>/` | JSFX source. Installs to `%APPDATA%\REAPER\Effects\stryk\`. |
+| `fxchains/<genre>/` | FX chains. Installs to `%APPDATA%\REAPER\FXChains\`. |
+| `projects/<name>/` | Scripts hardcoded to one project — not general-purpose. |
+| `tools/` | Harness and installers, listed below. |
+| `docs/` | Diagnoses, post-mortems, and the generated inventory. |
+| `install.ps1` | Installs scripts + JSFX + chains, backing up whatever it replaces. |
+
+| Tool | What |
+| --- | --- |
 | `tools/check_reascript.lua` | Compiles a script and nil-checks every `reaper.*` symbol it calls, without running it. |
 | `tools/Invoke-ReaperSandbox.ps1` | Runs a script in an isolated REAPER instance, optionally fully off-screen. |
-| `docs/` | Diagnoses and post-mortems. |
-| `docs/DC-BRIEF.md` | Self-contained paste-in briefing for a chat-only agent. |
-| `tools/Copy-DCBrief.ps1` | Puts that brief on the clipboard. `-WithScript` appends the full source. |
-| `install.ps1` | Copies `scripts/*.lua` into `%APPDATA%\REAPER\Scripts\`, backing up what it replaces. |
+| `tools/inventory.py` | Finds every REAPER asset on the box and groups by content hash. `--markdown` regenerates `docs/INVENTORY.md`. |
+| `tools/install_midi_strip_pc.py` | Installs the program-change stripper *and* wires its startup hook. `--status`, `--uninstall`. |
+| `tools/strip_pc.py` | Offline program-change stripper for `.mid` files on disk. |
+| `tools/Copy-DCBrief.ps1` | Puts `docs/DC-BRIEF.md` on the clipboard. `-WithScript` appends the full source. |
+
+### Why `<genre>` is a level
+
+`jsfx/` and `fxchains/` are split by genre because the content is genre-bound — the
+chains are literally named `144 Lead F-sharp`, and the JSFX are tuned around 144 BPM /
+F# / 432 Hz. A second genre drops in beside `trance130+/` without disturbing anything.
+
+`scripts/` and `tools/` deliberately have no genre level: they are general REAPER
+tooling and filing them under a genre would be a lie.
+
+Install one genre only with `.\install.ps1 -Genre 'trance130+'`. Note that JSFX from
+every genre are flattened into the single `Effects\stryk\` folder on install — REAPER
+keys its FX browser off the `desc:` line, not the folder, and renaming that folder
+would orphan every chain referencing `stryk\<name>`.
+
+### What lives where
+
+`docs/INVENTORY.md` is a generated map of every ReaScript, JSFX and FX chain on this
+machine — source copy, live copy, and every stale duplicate under `G:\tmp` — grouped by
+content hash so divergences are visible. Regenerate it, never hand-edit it:
+
+```powershell
+python tools\inventory.py --markdown > docs\INVENTORY.md
+python tools\inventory.py                 # human-readable, shows diverged copies
+```
+
+Identity comes from the bytes. Names and timestamps lie: `stryk_retune432_fixed` in
+`G:\tmp` looked like an unmerged fix and was byte-identical to the shipped version.
 
 ## Handing work to an agent with no file access
 

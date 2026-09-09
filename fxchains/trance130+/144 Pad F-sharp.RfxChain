@@ -1,0 +1,24 @@
+SHOW 0
+LASTSEL 0
+DOCKED 0
+BYPASS 0 0 0
+<JS stryk/stryk_trancegate ""
+1 0 0.6 0 1 0 0.6 0.25 1 0 0.6 0 1 0.3 0.75 0.45 1 2 25 100 100 144 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {7E2C6434-07A5-44D6-AEFA-136E8FD54287}
+WAK 0 0
+BYPASS 0 0 0
+<JS stryk/stryk_fs432_resonator ""
+6 2 432 4 0.96 6000 6 35 0 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {8D65C29A-E1F1-4C26-8690-9DF624B2D062}
+WAK 0 0
+BYPASS 0 0 0
+<JS stryk/stryk_width ""
+140 0 140 0 100 0 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {F7009ADF-2BB2-4CC4-9E95-718C4BDE5BAC}
+WAK 0 0

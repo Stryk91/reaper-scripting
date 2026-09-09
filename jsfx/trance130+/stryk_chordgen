@@ -1,0 +1,393 @@
+desc:STRYK ChordGen - diatonic chord stabs (F# / 144 / 432 defaults)
+//tags: MIDI generator chord harmony diatonic trance
+//author: STRYK 144 pack
+
+/* ------------------------------------------------------------------
+   ChordGen -- play ONE note, get a chord that stays in key.
+
+   Every incoming note is read as a scale degree of the selected
+   key/scale, and the upper voices are stacked out of THAT SCALE
+   (3rd, 5th, 7th, 9th) -- so nothing ever lands out of key, whatever
+   you play.  Power 5th and Octave are deliberately CHROMATIC (+7 /
+   +12): a power chord is not a diatonic construct, and the diatonic
+   "5th" on degree ii of a minor scale is a tritone, which is not what
+   you want under a stab.
+
+   Session defaults (144 BPM, key F# , A=432 Hz):
+     * Root defaults to F# , Scale to Natural Minor  -> F# Aeolian.
+     * A=432 is a synth-side tuning job, not a MIDI one: detune the
+       instrument -31.77 cents (12*log2(432/440)).  Note numbers do
+       not move, so this plugin needs no tuning control.
+       Reference: F#4 = MIDI 66 = 363.27 Hz at A=432.
+     * The readout shows LIVE project tempo (read from `tempo`, never
+       hardcoded) with 1/4, 1/8 and 1/16 in ms, for dialling stab
+       gates / delays elsewhere.  At 144: 1/4 = 416.7 ms,
+       1/8 = 208.3 ms, 1/16 = 104.2 ms, one 4/4 bar = 1666.7 ms.
+
+   NOTE TRACKING (the hard part, done properly):
+     * Every note this plugin emits is REFERENCE COUNTED per
+       (channel, note).  Two chords sharing a pitch do not cut each
+       other off -- a pitch only gets its note-off when the LAST
+       holder lets go.
+     * Every input note owns a list of the voices it added, so its
+       note-off releases exactly those voices and nothing else.
+     * The plugin owns all note traffic (it re-emits the played note
+       itself), which is what keeps the counts honest.
+     * Full release sweep on CC120 / CC123, transport stop, and
+       switching Latch off.  Nothing can hang.
+
+   EEL2 NOTE: string helpers below take their destination as a PLAIN
+   NUMERIC parameter (s), not a '#'-prefixed one.  EEL2 has no
+   '#'-prefixed function parameters -- `function f(#s)` is a compile
+   error that kills the whole @init section (and with it every
+   function @block and @gfx depend on).  Callers still pass #vars:
+   pcname(#gk, ...) works, because a #var evaluates to a string handle.
+   ------------------------------------------------------------------ */
+
+in_pin:none
+out_pin:none
+
+slider1:6<0,11,1{C,C#,D,D#,E,F,F#,G,G#,A,A#,B}>Key Root
+slider2:0<0,2,1{Natural Minor,Harmonic Minor,Major}>Scale
+slider3:0<0,5,1{Triad,7th,9th,Sus4,Power 5th,Octave}>Chord Type
+slider4:0<0,3,1>Inversion (lift N lowest added voices +1 oct)
+slider5:0<0,2,1>Spread (octaves added to the top voices)
+slider6:85<0,100,1>Added Voice Velocity (% of played note)
+slider7:0<0,16,1{All,Ch 1,Ch 2,Ch 3,Ch 4,Ch 5,Ch 6,Ch 7,Ch 8,Ch 9,Ch 10,Ch 11,Ch 12,Ch 13,Ch 14,Ch 15,Ch 16}>MIDI Channel Filter
+slider8:0<0,1,1{Off,On}>Hold / Latch
+
+@init
+ext_noinit = 1;   // keep held-note bookkeeping alive across transport / srate resets
+
+// ---------------- memory map ----------------
+outref = 0;       //     0 .. 2047  : emitted-note ref count, index [chan*128+note]
+slotb  = 2048;    //  2048 ..18431  : 2048 input slots, stride 8
+                  //                  [0]=active [1]=num added [2..5]=added note numbers
+sclb   = 18432;   // 18432 ..18455  : 3 scales, stride 8
+chtb   = 18464;   // 18464 ..18511  : 6 chord types, stride 8
+lastb  = 18512;   // 18512 ..18519  : last chord built (display only)
+memtop = 18520;
+freembuf(memtop);
+memset(0, 0, memtop);
+
+// ---------------- scale tables (semitones above the key root) ----------------
+sclb[0]  = 0;  sclb[1]  = 2;  sclb[2]  = 3;  sclb[3]  = 5;  sclb[4]  = 7;  sclb[5]  = 8;  sclb[6]  = 10;  // natural minor
+sclb[8]  = 0;  sclb[9]  = 2;  sclb[10] = 3;  sclb[11] = 5;  sclb[12] = 7;  sclb[13] = 8;  sclb[14] = 11;  // harmonic minor
+sclb[16] = 0;  sclb[17] = 2;  sclb[18] = 4;  sclb[19] = 5;  sclb[20] = 7;  sclb[21] = 9;  sclb[22] = 11;  // major
+
+// ---------------- chord tables ----------------
+// [n*8+0] = number of voices to ADD, [n*8+1..4] = offsets, [n*8+7] = 1 if offsets are semitones
+chtb[0]  = 2;  chtb[1]  = 2;  chtb[2]  = 4;                                chtb[7]  = 0;  // Triad     : 3rd 5th
+chtb[8]  = 3;  chtb[9]  = 2;  chtb[10] = 4;  chtb[11] = 6;                 chtb[15] = 0;  // 7th       : 3rd 5th 7th
+chtb[16] = 4;  chtb[17] = 2;  chtb[18] = 4;  chtb[19] = 6;  chtb[20] = 8;  chtb[23] = 0;  // 9th       : 3rd 5th 7th 9th
+chtb[24] = 2;  chtb[25] = 3;  chtb[26] = 4;                                chtb[31] = 0;  // Sus4      : 4th 5th
+chtb[32] = 1;  chtb[33] = 7;                                               chtb[39] = 1;  // Power 5th : +7 semitones
+chtb[40] = 1;  chtb[41] = 12;                                              chtb[47] = 1;  // Octave    : +12 semitones
+
+curtempo       = 144;
+prevplay       = 0;
+pending_alloff = 0;
+lastcnt        = 0;
+lastroot       = 0;
+latchprev      = slider8|0;
+
+// ---------------- note emission, reference counted ----------------
+// Emitting a pitch that is already sounding re-triggers it cleanly
+// (note-off then note-on) but only bumps the counter, so the FIRST
+// holder letting go will not silence the second one.
+function note_out(ch, nt, vel, ofs) local(ix)
+(
+  ((nt >= 0) && (nt <= 127)) ? (
+    ix = outref + ch*128 + nt;
+    ix[0] > 0 ? ( midisend(ofs, 0x80 + ch, nt, 0); );
+    midisend(ofs, 0x90 + ch, nt, vel);
+    ix[0] = ix[0] + 1;
+  );
+);
+
+function note_kill(ch, nt, ofs) local(ix)
+(
+  ((nt >= 0) && (nt <= 127)) ? (
+    ix = outref + ch*128 + nt;
+    ix[0] > 0 ? (
+      ix[0] = ix[0] - 1;
+      ix[0] <= 0 ? (
+        ix[0] = 0;
+        midisend(ofs, 0x80 + ch, nt, 0);
+      );
+    );
+  );
+);
+
+// Release the played note plus EXACTLY the voices it added.
+function chord_off(ch, nt, ofs) local(sl, i, n)
+(
+  sl = slotb + (ch*128 + nt)*8;
+  sl[0] > 0 ? (
+    n = sl[1];
+    i = 0;
+    loop(n,
+      note_kill(ch, sl[2 + i], ofs);
+      i += 1;
+    );
+    note_kill(ch, nt, ofs);
+    sl[0] = 0;
+    sl[1] = 0;
+  );
+);
+
+// dochord = 0 -> pass the note straight through, but still track it, so
+// the note-off path and the reference counts stay consistent.
+function chord_on(ch, nt, vel, ofs, dochord)
+                 local(sl, rel, oc, pc, deg, i, k, n, av, nn, cnt, chrom, idx, oadd, lift)
+(
+  sl = slotb + (ch*128 + nt)*8;
+  sl[0] > 0 ? ( chord_off(ch, nt, ofs); );   // safety: re-trigger of a note already held
+
+  note_out(ch, nt, vel, ofs);
+  sl[0] = 1;
+  sl[1] = 0;
+  n = 0;
+
+  dochord ? (
+    // ---- which scale degree was played? ----
+    rel = nt - keyroot;
+    oc  = floor(rel / 12);
+    pc  = rel - oc*12;                       // 0..11, correct for negative rel
+    deg = 0;
+    i = 0;
+    loop(7,
+      sclb[scaleoff + i] <= pc ? ( deg = i; );  // largest degree at or below the note
+      i += 1;
+    );
+
+    av = floor(vel * velpct * 0.01 + 0.5);
+    av < 1   ? ( av = 1; );
+    av > 127 ? ( av = 127; );
+
+    cnt   = chtb[ctypeoff];
+    chrom = chtb[ctypeoff + 7];
+
+    i = 0;
+    loop(cnt,
+      chrom ? (
+        nn = nt + chtb[ctypeoff + 1 + i];
+      ) : (
+        idx  = deg + chtb[ctypeoff + 1 + i];
+        oadd = floor(idx / 7);
+        k    = idx - oadd*7;
+        nn   = keyroot + (oc + oadd)*12 + sclb[scaleoff + k];
+      );
+      i < inv ? ( nn = nn + 12; );                  // inversion: lift the lowest voices
+      lift = spread - (cnt - 1 - i);
+      lift > 0 ? ( nn = nn + 12*lift; );            // spread: widen from the top down
+      ((nn > nt) && (nn <= 127) && (n < 4)) ? (
+        sl[2 + n] = nn;
+        n += 1;
+        note_out(ch, nn, av, ofs);
+      );
+      i += 1;
+    );
+
+    // copy for the display
+    lastroot = nt;
+    i = 0;
+    loop(n, lastb[i] = sl[2 + i]; i += 1; );
+    lastcnt = n;
+  );
+
+  sl[1] = n;
+);
+
+// Release everything we are holding, then force any straggler off.
+function panic_all(ofs) local(i, c2, n2, sl)
+(
+  i = 0;
+  loop(2048,
+    sl = slotb + i*8;
+    sl[0] > 0 ? (
+      c2 = (i/128)|0;
+      n2 = i - c2*128;
+      chord_off(c2, n2, ofs);
+    );
+    i += 1;
+  );
+  i = 0;
+  loop(2048,
+    outref[i] > 0 ? (
+      c2 = (i/128)|0;
+      n2 = i - c2*128;
+      midisend(ofs, 0x80 + c2, n2, 0);
+      outref[i] = 0;
+    );
+    i += 1;
+  );
+  lastcnt = 0;
+);
+
+// ---------------- display helpers ----------------
+// 's' is a STRING HANDLE passed in as a plain numeric parameter.
+// EEL2 has no '#'-prefixed function parameters -- callers pass #vars,
+// which evaluate to the handle, and strcpy/sprintf accept it.
+function pcname(s, pc)
+(
+  pc = pc - floor(pc/12)*12;
+  pc == 0  ? strcpy(s,"C")  :
+  pc == 1  ? strcpy(s,"C#") :
+  pc == 2  ? strcpy(s,"D")  :
+  pc == 3  ? strcpy(s,"D#") :
+  pc == 4  ? strcpy(s,"E")  :
+  pc == 5  ? strcpy(s,"F")  :
+  pc == 6  ? strcpy(s,"F#") :
+  pc == 7  ? strcpy(s,"G")  :
+  pc == 8  ? strcpy(s,"G#") :
+  pc == 9  ? strcpy(s,"A")  :
+  pc == 10 ? strcpy(s,"A#") : strcpy(s,"B");
+);
+
+function nname(s, nt) local(o)
+(
+  pcname(s, nt);
+  o = floor(nt/12) - 1;
+  strcpy(#gtmp, s);
+  sprintf(s, "%s%d", #gtmp, o);
+);
+
+@slider
+keyroot  = slider1|0;                      // pitch class 0..11 of the key root
+scaleoff = (slider2|0)*8;
+ctypeoff = (slider3|0)*8;
+inv      = slider4|0;
+spread   = slider5|0;
+velpct   = max(0, min(100, slider6));
+chfilt   = slider7|0;                      // 0 = all channels, else channel = chfilt-1
+latch    = slider8|0;
+
+// MIDI cannot be sent from @slider -- raise a flag, sweep at the top of @block.
+latch != latchprev ? (
+  latch == 0 ? ( pending_alloff = 1; );
+  latchprev = latch;
+);
+
+@block
+curtempo = tempo > 0 ? tempo : curtempo;
+
+// transport just stopped -> drop anything still latched
+(((play_state & 1) == 0) && ((prevplay & 1) != 0)) ? ( pending_alloff = 1; );
+prevplay = play_state;
+
+pending_alloff ? ( panic_all(0); pending_alloff = 0; );
+
+while (midirecv(mofs, msg1, msg2, msg3)) (
+  mstat = msg1 & 0xF0;
+  mch   = msg1 & 0x0F;
+  eat   = 0;
+
+  ((mstat == 0x90) && (msg3 > 0)) ? (
+    // ---------------- note on ----------------
+    passes = ((chfilt == 0) || (chfilt == mch + 1));
+    sl = slotb + (mch*128 + msg2)*8;
+    ((latch != 0) && (passes != 0) && (sl[0] > 0)) ? (
+      chord_off(mch, msg2, mofs);              // latch: a second press releases it
+    ) : (
+      chord_on(mch, msg2, msg3, mofs, passes);
+    );
+    eat = 1;
+  ) : ((mstat == 0x80) || (mstat == 0x90)) ? (
+    // ---------------- note off ----------------
+    passes = ((chfilt == 0) || (chfilt == mch + 1));
+    sl = slotb + (mch*128 + msg2)*8;
+    ((latch != 0) && (passes != 0)) ? (
+      eat = 1;                                 // latched: swallow it, the chord holds
+    ) : (
+      sl[0] > 0 ? (
+        chord_off(mch, msg2, mofs);
+        eat = 1;
+      );
+    );
+  ) : ((mstat == 0xB0) && ((msg2 == 120) || (msg2 == 123))) ? (
+    // all-sound-off / all-notes-off: clean up, then let the CC through
+    panic_all(mofs);
+  );
+
+  eat ? 0 : midisend(mofs, msg1, msg2, msg3);
+);
+
+@gfx 520 176
+gfx_r = 0.055; gfx_g = 0.065; gfx_b = 0.095; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+gfx_setfont(1, "Arial", 18);
+gfx_r = 0.42; gfx_g = 0.85; gfx_b = 1.0;
+gfx_x = 12; gfx_y = 8;
+gfx_drawstr("STRYK ChordGen");
+
+// ---- key / scale / chord line ----
+gfx_setfont(2, "Arial", 14);
+pcname(#gk, slider1);
+gsc = slider2|0;
+gsc == 0 ? strcpy(#gs,"Natural Minor") : gsc == 1 ? strcpy(#gs,"Harmonic Minor") : strcpy(#gs,"Major");
+gct = slider3|0;
+gct == 0 ? strcpy(#gc,"Triad") :
+gct == 1 ? strcpy(#gc,"7th") :
+gct == 2 ? strcpy(#gc,"9th") :
+gct == 3 ? strcpy(#gc,"Sus4") :
+gct == 4 ? strcpy(#gc,"Power 5th") : strcpy(#gc,"Octave");
+sprintf(#gl1, "%s %s    %s    inv %d    spread %d", #gk, #gs, #gc, slider4|0, slider5|0);
+gfx_r = 0.80; gfx_g = 0.84; gfx_b = 0.92;
+gfx_x = 12; gfx_y = 36;
+gfx_drawstr(#gl1);
+
+// ---- last chord built ----
+lastcnt > 0 ? (
+  nname(#gl2, lastroot);
+  gi = 0;
+  loop(lastcnt,
+    nname(#gv, lastb[gi]);
+    strcpy(#gl3, #gl2);
+    sprintf(#gl2, "%s  %s", #gl3, #gv);
+    gi += 1;
+  );
+) : (
+  strcpy(#gl2, "-- play a note --");
+);
+gfx_setfont(3, "Arial", 16);
+gfx_r = 0.45; gfx_g = 0.95; gfx_b = 0.75;
+gfx_x = 12; gfx_y = 58;
+gfx_drawstr(#gl2);
+
+// ---- live tempo readout (from the project, never hardcoded) ----
+gbeat = curtempo > 0 ? 60000 / curtempo : 416.667;
+gfx_setfont(2, "Arial", 14);
+gfx_r = 0.55; gfx_g = 0.58; gfx_b = 0.68;
+latch ? strcpy(#gh, "   [LATCH]") : strcpy(#gh, "");
+sprintf(#gl4, "%.1f BPM   1/4 %.1f ms   1/8 %.1f ms   1/16 %.1f ms%s",
+        curtempo, gbeat, gbeat*0.5, gbeat*0.25, #gh);
+gfx_x = 12; gfx_y = 84;
+gfx_drawstr(#gl4);
+
+// ---- sounding-note strip, MIDI 0..127 ----
+gy0 = 112;
+gsw = (gfx_w - 24) / 128;
+gsw < 1 ? ( gsw = 1; );
+gi = 0;
+loop(128,
+  gsum = 0;
+  gj = 0;
+  loop(16, gsum += outref[gj*128 + gi]; gj += 1; );
+  gpc = gi - floor(gi/12)*12;
+  gblk = ((gpc == 1) || (gpc == 3) || (gpc == 6) || (gpc == 8) || (gpc == 10));
+  gsum > 0 ? ( gfx_r = 0.30; gfx_g = 0.95; gfx_b = 0.72; ) :
+  gblk     ? ( gfx_r = 0.12; gfx_g = 0.13; gfx_b = 0.17; ) :
+             ( gfx_r = 0.21; gfx_g = 0.22; gfx_b = 0.27; );
+  gfx_rect(12 + gi*gsw, gy0, max(1, gsw - 1), 34);
+  gi += 1;
+);
+
+// key-root tick under every octave of the strip
+gfx_r = 0.42; gfx_g = 0.85; gfx_b = 1.0;
+gi = keyroot;
+while (gi < 128) (
+  gfx_rect(12 + gi*gsw, gy0 + 36, max(1, gsw - 1), 3);
+  gi += 12;
+);

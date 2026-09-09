@@ -1,0 +1,295 @@
+desc:STRYK F#/432 Resonator Bank
+//tags: resonator comb karplus-strong tonal tuned trance
+//author: STRYK 144 pack
+
+/*
+   STRYK F#/432 RESONATOR BANK
+   ---------------------------
+   Feed it drums, noise, percussion loops or anything broadband and it rings in key.
+
+   Each voice is a tuned comb / Karplus-Strong delay line with a one-pole lowpass
+   (damping) inside the feedback loop. Voice k rings at k * root frequency, i.e. the
+   harmonic series 1,2,3,4,5,6 x the root, so it fattens rather than clashes.
+
+   DEFAULTS FOR THE CURRENT SESSION -- 144 BPM, key F#, A = 432 Hz:
+     Root note   = F#            (semitone index 6)
+     Octave      = 2             -> midi 42 -> F#2
+     Reference   = 432.0 Hz      (A=432; that is -31.77 cents vs A=440)
+     f = ref * 2^((midinote-69)/12),  midinote = 12*(octave+1) + semitone
+     F#2 = 432 * 2^((42-69)/12) = 90.82 Hz   <- the default fundamental
+     Voice freqs at defaults (4 voices, before the 6-cent spread):
+       x1  90.82 Hz (F#2)   x2 181.63 Hz (F#3)
+       x3 272.45 Hz         x4 363.27 Hz (F#4)
+     Full F# ladder at A=432 for reference:
+       F#0 22.70  F#1 45.41  F#2 90.82  F#3 181.63
+       F#4 363.27 F#5 726.54 F#6 1453.08 F#7 2906.16
+
+   There is no tempo-synced element in this unit, so it does not read `tempo` --
+   ring length is set by Decay + Damping, which is what you actually want to tweak
+   against a 144 BPM groove (beat = 416.667 ms, 1/8 = 208.333 ms, 1/16 = 104.167 ms).
+   At Decay 0.96 / Damp 6000 Hz the F#2 voice rings roughly 1.9 s, the x4 voice
+   about 0.5 s -- a long tail under the kick and a tight metallic bloom on hats.
+
+   Notes on the implementation:
+     * Fractional (linear-interpolated) delay taps, so the tuning is accurate at any
+       samplerate, and delay length is smoothed -> slider moves glide instead of click.
+     * The one-pole damping filter inside the loop adds its own phase delay, which
+       would flatten the pitch. That phase delay is calculated and subtracted from the
+       delay line length, so the voice still lands on the right frequency.
+     * A feedback comb resonates at EVERY multiple of its fundamental, and that
+       includes 0 Hz, where its gain is 1/(1-decay): 25x at Decay 0.96, 1000x at
+       0.999. On the short delay lines you get at high Octave settings that 0 Hz peak
+       is tens of Hz wide, so gated or percussive material comes back out of the unit
+       as large amounts of inaudible sub-20 Hz energy. The excitation is therefore
+       highpassed by a two-pole filter cornered at 0.3 x the root, which is comfortably
+       below every voice mode (the lowest is the root itself) and comfortably above
+       DC -- it starves the 0 Hz resonance without touching a single musical mode, and
+       without putting anything inside the feedback loop that could detune it.
+     * Auto gain compensation: input to the combs is scaled by (1-decay)^0.7 so
+       turning Decay up does not turn the plugin into a fire alarm.
+     * Voices alternate hard-ish L / R and are detuned in opposite directions by
+       Spread cents, which is where the width comes from.
+     * Voices whose frequency would land above 0.45*samplerate are muted, not aliased.
+     * Loop state is hard-clamped and NaN-trapped, so it cannot run away.
+     * ext_tail_size is declared so the ring is not chopped off when the transport
+       stops or at the end of a render -- the default ring is longer than the tail
+       REAPER assumes for a JSFX that does not ask for one.
+
+   Mix uses a constant-power crossfade (dry = sqrt(1-m), wet = sqrt(m)) so the dry
+   drums do not go thin as you dial wet in.
+*/
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+slider1:6<0,11,1{C,C#,D,D#,E,F,F#,G,G#,A,A#,B}>Root Note
+slider2:2<0,7,1>Octave (2 = F#2 90.82 Hz at 432)
+slider3:432<400,460,0.1>Reference Hz (A4 tuning)
+slider4:4<1,6,1>Voices (harmonics 1..6 x root)
+slider5:0.96<0.5,0.999,0.001>Decay / Resonance (loop feedback)
+slider6:6000<500,18000,10>Damping (Hz, lowpass in loop)
+slider7:6<0,25,0.1>Spread (cents detune, stereo width)
+slider8:35<0,100,0.1>Mix (% wet)
+slider9:0<-24,24,0.1>Output Trim (dB)
+
+@init
+ext_nodenorm  = 1;
+ext_tail_size = srate * 4;    // let the ring finish on stop / at the end of a render
+
+DBUFSZ = 65536;               // per-voice delay line, covers 8 Hz even at 384 kHz
+NVMAX  = 6;
+STB    = NVMAX * DBUFSZ;      // base of the state block
+
+v_len  = STB;                 // current (smoothed) delay length, samples
+v_pos  = STB + 8;             // write index
+v_lp   = STB + 16;            // damping one-pole state
+v_gl   = STB + 24;            // current left  gain (amp * pan)
+v_gr   = STB + 32;            // current right gain
+v_tlen = STB + 40;            // target delay length
+v_tgl  = STB + 48;            // target left gain
+v_tgr  = STB + 56;            // target right gain
+v_freq = STB + 64;            // display frequency
+MEMTOP = STB + 72;
+
+memset(0, 0, MEMTOP);
+freembuf(MEMTOP);
+
+function calc_voices() local(i, sgn, mag, det, f, fn, d, w, a, pd, p, amp, nrm, m, hpin)
+(
+  nv = min(max(slider4|0, 1), NVMAX);
+
+  refhz    = min(max(slider3, 200), 1000);
+  rootmidi = 12 * ((slider2|0) + 1) + (slider1|0);
+  f0       = refhz * pow(2, (rootmidi - 69) / 12);
+
+  fb = min(max(slider5, 0), 0.9995);
+
+  dampf = min(max(slider6, 20), srate * 0.45);
+  dcoef = 1 - exp(-2 * $pi * dampf / srate);
+  dcoef = min(max(dcoef, 0.0001), 1);
+  a     = 1 - dcoef;
+
+  // excitation highpass: sits under the lowest voice mode (the root) and well over
+  // DC, so it starves the comb's 0 Hz resonance without touching a musical mode
+  hpin = min(max(f0 * 0.3, 10), min(600, srate * 0.05));
+  dcR  = exp(-2 * $pi * hpin / srate);
+
+  // auto gain compensation for the comb's resonant gain of 1/(1-fb)
+  nrm    = max(1 - fb, 0.0015);
+  ingain = pow(nrm, 0.7) * 1.4 / sqrt(nv);
+
+  i = 0;
+  loop(NVMAX,
+    fn  = f0 * (i + 1);                                   // harmonic k = i+1
+    sgn = (i & 1) ? 1 : -1;                               // odd voices right, even left
+    mag = nv < 2 ? 0 : (floor(i * 0.5) + 1) / ceil(nv * 0.5);
+    det = slider7 * sgn * mag;                            // cents
+    f   = fn * pow(2, det / 1200);
+    v_freq[i] = f;
+
+    amp = (i < nv && f < srate * 0.45) ? 1 / sqrt(i + 1) : 0;
+
+    f = min(max(f, 10), srate * 0.45);
+    d = srate / f;
+
+    // subtract the damping filter's phase delay so the pitch stays true
+    w  = 2 * $pi * f / srate;
+    pd = atan( (a * sin(w)) / max(1 - a * cos(w), 0.000001) ) / max(w, 0.000001);
+    d  = min(max(d - pd, 2), DBUFSZ - 4);
+
+    v_tlen[i] = d;
+
+    p = sgn * mag * 0.85;                                 // -1 = left .. +1 = right
+    v_tgl[i] = amp * cos($pi * 0.25 * (p + 1));
+    v_tgr[i] = amp * sin($pi * 0.25 * (p + 1));
+
+    // first time this voice is touched, snap instead of gliding from zero
+    v_len[i] < 2 ? (
+      v_len[i] = d;
+      v_gl[i]  = v_tgl[i];
+      v_gr[i]  = v_tgr[i];
+    );
+
+    i += 1;
+  );
+
+  m    = min(max(slider8 * 0.01, 0), 1);
+  dryt = sqrt(1 - m);
+  wett = sqrt(m);
+  outt = pow(10, slider9 / 20);
+);
+
+smc  = 1 - exp(-1 / (0.02 * srate));   // ~20 ms control smoothing
+antid = 0.00000000000000000001;        // 1e-20 anti-denormal trickle
+inmix = 0.5;
+
+calc_voices();
+
+dryg = dryt;
+wetg = wett;
+outg = outt;
+
+@slider
+calc_voices();
+
+@block
+inmix = num_ch < 2 ? 1 : 0.5;
+
+@sample
+inx = (spl0 + spl1) * inmix;
+
+// two-pole highpass on the excitation only -- the dry path is untouched
+dcy  = inx - dcx1 + dcR * dcy1;
+dcx1 = inx;
+dcy1 = dcy;
+
+dcz  = dcy - dcx2 + dcR * dcy2;
+dcx2 = dcy;
+dcy2 = dcz;
+
+xin = dcz * ingain + antid;
+
+dryg += (dryt - dryg) * smc;
+wetg += (wett - wetg) * smc;
+outg += (outt - outg) * smc;
+
+wl = 0;
+wr = 0;
+vi = 0;
+loop(nv,
+  vbase = vi * DBUFSZ;
+
+  vl = v_len[vi] + (v_tlen[vi] - v_len[vi]) * smc;  v_len[vi] = vl;
+  gl = v_gl[vi]  + (v_tgl[vi]  - v_gl[vi])  * smc;  v_gl[vi]  = gl;
+  gr = v_gr[vi]  + (v_tgr[vi]  - v_gr[vi])  * smc;  v_gr[vi]  = gr;
+
+  wp = v_pos[vi];
+  rp = wp - vl;
+  rp < 0 ? rp += DBUFSZ;
+  ri  = rp|0;
+  frc = rp - ri;
+  ri2 = ri + 1;
+  ri2 >= DBUFSZ ? ri2 = 0;
+
+  sv = vbase[ri] + frc * (vbase[ri2] - vbase[ri]);
+
+  lpv = v_lp[vi] + dcoef * (sv - v_lp[vi]);
+  v_lp[vi] = lpv;
+
+  nsv = xin + fb * lpv;
+  !(abs(nsv) < 100000000000000000000000000000.0) ? nsv = 0;   // NaN / inf trap
+  nsv = min(max(nsv, -16), 16);
+  vbase[wp] = nsv;
+
+  wp += 1;
+  wp >= DBUFSZ ? wp = 0;
+  v_pos[vi] = wp;
+
+  wl += sv * gl;
+  wr += sv * gr;
+
+  vi += 1;
+);
+
+spl0 = (spl0 * dryg + wl * wetg) * outg;
+spl1 = (spl1 * dryg + wr * wetg) * outg;
+
+@gfx 480 230
+gfx_setfont(1, "Arial", 14);
+
+gfx_r = 0.07; gfx_g = 0.08; gfx_b = 0.10; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+gn = slider1|0;
+gn == 0  ? strcpy(#nm, "C")  :
+(gn == 1  ? strcpy(#nm, "C#") :
+(gn == 2  ? strcpy(#nm, "D")  :
+(gn == 3  ? strcpy(#nm, "D#") :
+(gn == 4  ? strcpy(#nm, "E")  :
+(gn == 5  ? strcpy(#nm, "F")  :
+(gn == 6  ? strcpy(#nm, "F#") :
+(gn == 7  ? strcpy(#nm, "G")  :
+(gn == 8  ? strcpy(#nm, "G#") :
+(gn == 9  ? strcpy(#nm, "A")  :
+(gn == 10 ? strcpy(#nm, "A#") : strcpy(#nm, "B")))))))))));
+
+gfx_r = 0.98; gfx_g = 0.78; gfx_b = 0.28;
+gfx_x = 12; gfx_y = 10;
+sprintf(#s, "RESONATOR BANK   root %s%d = %.2f Hz   ref %.1f Hz", #nm, slider2|0, f0, refhz);
+gfx_drawstr(#s);
+
+gfx_r = 0.62; gfx_g = 0.68; gfx_b = 0.78;
+gfx_x = 12; gfx_y = 30;
+sprintf(#s, "decay %.3f   damp %.0f Hz   spread %.1f ct   mix %.0f%%   trim %.1f dB",
+        slider5, slider6, slider7, slider8, slider9);
+gfx_drawstr(#s);
+
+gfx_r = 0.20; gfx_g = 0.23; gfx_b = 0.28;
+gfx_rect(12, 48, gfx_w - 24, 1);
+
+gi = 0;
+loop(min(max(nv, 1), NVMAX),
+  gy = 58 + gi * 26;
+  ggl = v_gl[gi];
+  ggr = v_gr[gi];
+
+  ggl > ggr * 1.05 ? strcpy(#pn, "L") :
+  (ggr > ggl * 1.05 ? strcpy(#pn, "R") : strcpy(#pn, "C"));
+
+  gfx_r = 0.80; gfx_g = 0.84; gfx_b = 0.90;
+  gfx_x = 16; gfx_y = gy;
+  sprintf(#s, "x%d   %.2f Hz   %s", gi + 1, v_freq[gi], #pn);
+  gfx_drawstr(#s);
+
+  gbw = min((ggl + ggr) / 1.4142, 1) * (gfx_w - 220);
+  gbw > 0 ? (
+    gfx_r = 0.20 + 0.70 * (ggr > ggl);
+    gfx_g = 0.55;
+    gfx_b = 0.90 - 0.55 * (ggr > ggl);
+    gfx_rect(206, gy + 2, gbw, 11);
+  );
+
+  gi += 1;
+);

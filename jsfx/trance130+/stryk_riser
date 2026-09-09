@@ -1,0 +1,303 @@
+desc:STRYK Riser -- bar-synced build-up generator (144 BPM / F# / A=432)
+//tags: generator riser sweep noise synthesis trance build-up transition
+//author: STRYK 144 pack
+
+/*
+  ------------------------------------------------------------------------
+  WHAT IT IS
+  A tone GENERATOR. It adds a rising noise/sine sweep to whatever is on the
+  track (it does not need any input -- drop it on an empty track and hit
+  play). The ramp is locked to the BAR GRID so the peak lands on the
+  downbeat of the drop, every time, with no automation drawn.
+
+  ------------------------------------------------------------------------
+  THE BAR MATHS (this is the whole trick)
+
+  beat_position is in QUARTER NOTES and is updated once per audio BLOCK, so
+  we latch it at @block and advance it per sample:
+
+      beats_per_bar = ts_num * 4 / ts_denom      // 4/4 -> 4 QN per bar
+      beat_inc      = tempo / (60 * srate)       // QN advanced per sample
+      window_beats  = Length_in_bars * beats_per_bar
+      pos           = beat_position / window_beats      (in "windows")
+      ph            = pos - floor(pos)                  (0 .. 1)
+
+  ph == 0.0 exactly on the downbeat that STARTS the riser window, and
+  reaches 1.0 (exclusive) on the LAST SAMPLE before the downbeat that ENDS
+  it -- i.e. the drop. So the peak of the sweep and of the envelope is the
+  final sample before the drop's downbeat, and the release tail carries the
+  sound across the bar line. That is exactly how a riser should behave.
+  Because it is derived from beat_position and not from a free-running
+  counter, it stays correct after any transport jump, loop or tempo change.
+
+  Tempo is read from the HOST (`tempo`), never hardcoded. 144 is only the
+  reference for the numbers below.
+
+  At 144 BPM, 4/4:  beat = 416.667 ms   bar = 1666.67 ms
+      1 bar  =  1.667 s     2 bars =  3.333 s     4 bars =  6.667 s
+      8 bars = 13.333 s    16 bars = 26.667 s    32 bars = 53.333 s
+  (Companion grid for the rest of the pack:
+      1/2 = 833.33  1/4 = 416.667  1/8 = 208.333  1/16 = 104.167
+      dotted 1/8 = 312.5  dotted 1/16 = 156.25  triplet 1/8 = 138.889)
+
+  ------------------------------------------------------------------------
+  A = 432 Hz / KEY OF F#
+  440 -> 432 is 12*log2(432/440) = -31.77 cents. freq = 432*2^((note-69)/12).
+  F# at A=432:  F#0 22.70   F#1 45.41   F#2 90.82   F#3 181.63
+                F#4 363.27  F#5 726.54  F#6 1453.08 F#7 2906.16
+  Start Hz defaults to 200 (just above F#3, a broad sub-free start). To make
+  the sweep launch ON the root type 181.63 (F#3) or 363.27 (F#4) into Start
+  Hz -- the sweep is exponential in frequency so the root sings through the
+  first bars. End 12000 clears the top of the mix for the drop.
+
+  ------------------------------------------------------------------------
+  SIGNAL PATH
+  White/Pink noise -> resonant BANDPASS (TPT/ZDF state-variable, stable at
+  any cutoff) whose centre frequency sweeps Start -> End. The bandpass
+  output is scaled by 1/sqrt(Q) so Resonance changes CHARACTER, not level.
+
+  Pink is the default because a constant-Q bandpass has bandwidth
+  proportional to f0 while pink noise has power proportional to 1/f, so the
+  passed power = (1/f)*f = CONSTANT across the whole sweep -- the riser gets
+  brighter without getting harsher. White noise deliberately gets louder as
+  it climbs (about +3 dB/oct) for aggressive tech-trance risers.
+
+  Sine Sweep is an oscillator whose pitch IS the sweep (Resonance does not
+  apply to it) -- the classic "kettle" riser.
+
+  Curve 0 = exponential (everything happens in the last couple of bars, the
+  uplifting default) .. 1 = linear (steady climb):
+      freq exponent = 1 + (1-Curve)*2      (Curve 0.3 -> 2.4)
+      amp  exponent = 0.5 + (1-Curve)      (Curve 0.3 -> 1.2)
+      f(ph) = Start * (End/Start)^(ph^freq_exponent)     // octave-linear
+      a(ph) = ph^amp_exponent
+
+  Stereo Spread widens by (a) decorrelating the two noise streams with an
+  equal-power blend against a shared stream and (b) detuning the two
+  filters/oscillators by +/- (Spread * 40) cents. At 0% it is dead mono.
+
+  Output is soft-saturated (tanh-shaped) after the Level control, so it
+  cannot exceed 0 dBFS no matter what you do to it.
+  ------------------------------------------------------------------------
+*/
+
+slider1:4<0,5,1{1 bar,2 bars,4 bars,8 bars,16 bars,32 bars}>Length (bars)
+slider2:1<0,2,1{White Noise,Pink Noise,Sine Sweep}>Source
+slider3:200<20,20000,1>Start Hz
+slider4:12000<20,20000,1>End Hz
+slider5:3<0.5,20,0.01>Resonance (Q)
+slider6:0.3<0,1,0.01>Curve (0=exponential .. 1=linear)
+slider7:-12<-60,0,0.1>Level (dB)
+slider8:60<0,100,1>Stereo Spread (%)
+slider9:0<0,1,1{Follow Transport,Manual Retrigger}>Trigger Mode
+slider10:0<0,1,1{Idle,FIRE}>Manual Fire (Manual mode only)
+slider11:80<0,2000,1>Post-peak Release (ms)
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+@init
+ext_nodenorm = 1;
+
+// soft saturator, monotonic, saturates to +/-1 (safety net, near-linear below ~0.5)
+function sat(x) (
+  x = max(-3, min(3, x));
+  x*(27 + x*x)/(27 + 9*x*x);
+);
+
+// every slider/samplerate dependent coefficient lives here so @init and
+// @slider share one code path (@init re-runs when samplerate changes)
+function upd() (
+  bars    = pow(2, min(5, max(0, slider1|0)));           // 1,2,4,8,16,32
+  src     = min(2, max(0, slider2|0));
+  f_start = max(20, min(20000, slider3));
+  f_end   = max(20, min(20000, slider4));
+  lograt  = log(f_end/f_start);                          // octave-linear sweep
+  qv      = max(0.5, min(20, slider5));
+  kq      = 1/qv;                                        // SVF damping = 1/Q
+  sq_k    = sqrt(kq);                                    // level-invariant BP trim
+  cv      = max(0, min(1, slider6));
+  exp_f   = 1 + (1-cv)*2;
+  exp_a   = 0.5 + (1-cv);
+  lvl_t   = exp(log(10)*slider7/20);
+  slider7 <= -60 ? lvl_t = 0;                            // bottom of slider = off
+  spr     = max(0, min(100, slider8))/100;
+  wa      = 1 - spr;                                     // shared noise weight
+  wb      = spr;                                         // independent weight
+  nrm     = 1/max(0.0001, sqrt(wa*wa + wb*wb));          // equal-power blend
+  dtu     = exp(log(2)*(spr*40)/1200);                   // +cents (right)
+  dtd     = 1/dtu;                                       // -cents (left)
+  mode    = slider9|0;
+  relc    = 1 - exp(-1/max(1, slider11*0.001*srate));    // one-pole release
+  lvlc    = 1 - exp(-2*$pi*20/srate);                    // 20 Hz gain smoother
+);
+
+// filter / oscillator / noise state
+ic1L = ic2L = ic1R = ic2R = 0;
+pl0 = pl1 = pl2 = pr0 = pr1 = pr2 = 0;
+opL = 0; opR = 0.25;                                     // sine phases, quarter apart
+
+// transport / ramp state
+cur_beat = 0; ph = 0; env = 0; fcur = 200; lvl_s = 0;
+mph = 1; mrun = 0; fire_prev = 0; run = 0;
+tsn = 4; tsd = 4; bpb = 4; tp = 144;
+beat_inc = 144/(60*srate); winb = 64; winb_inv = 1/64; ph_inc = beat_inc/64;
+
+upd();
+
+@slider
+upd();
+// rising edge on Manual Fire retriggers the ramp from zero
+slider10 >= 0.5 && fire_prev < 0.5 ? ( mph = 0; mrun = 1; );
+fire_prev = slider10;
+
+@block
+tsn = ts_num   < 1 ? 4 : ts_num;
+tsd = ts_denom < 1 ? 4 : ts_denom;
+bpb = tsn*4/tsd;                       // quarter notes per bar
+tp  = tempo < 1 ? 144 : tempo;         // host tempo; 144 only as a fallback
+beat_inc = tp/(60*srate);              // quarter notes per sample
+winb     = max(0.001, bars*bpb);       // quarter notes in one riser window
+winb_inv = 1/winb;
+ph_inc   = beat_inc*winb_inv;          // ramp units per sample
+
+mode == 0 ? (
+  (play_state & 1) ? ( cur_beat = beat_position; run = 1; ) : ( run = 0; );
+);
+
+@sample
+// ---- ramp position 0..1 -------------------------------------------------
+mode == 0 ? (
+  run ? (
+    cur_beat += beat_inc;
+    wpos = cur_beat*winb_inv;
+    ph = wpos - floor(wpos);           // no fmod in EEL2
+  ) : ( ph = 0; );
+) : (
+  mrun ? (
+    mph += ph_inc;
+    mph >= 1 ? ( mph = 1; mrun = 0; );
+    ph = mph;
+  ) : ( ph = 0; );
+);
+
+// ---- envelope: instant attack, timed release over the bar line -----------
+amp = pow(ph, exp_a);
+rising = amp >= env;
+rising ? ( env = amp; ) : ( env += (amp - env)*relc; );
+
+// freeze the sweep frequency during the release tail so the wrap does not
+// audibly snap back down to Start Hz right on the drop
+rising ? ( fcur = f_start*exp(lograt*pow(ph, exp_f)); );
+
+lvl_s += (lvl_t - lvl_s)*lvlc;         // zipper-free gain
+
+(env > 0.0000001 || ph > 0) ? (
+
+  fL = min(max(fcur*dtd, 10), srate*0.45);
+  fR = min(max(fcur*dtu, 10), srate*0.45);
+
+  src < 2 ? (
+    // ---- noise sources ---------------------------------------------------
+    n0 = rand(2) - 1;  n1 = rand(2) - 1;  n2 = rand(2) - 1;
+    xl = (wa*n0 + wb*n1)*nrm;
+    xr = (wa*n0 + wb*n2)*nrm;
+
+    src == 1 ? (
+      // Paul Kellet economy pink filter, one instance per channel
+      pl0 = 0.99765*pl0 + xl*0.0990460;
+      pl1 = 0.96300*pl1 + xl*0.2965164;
+      pl2 = 0.57000*pl2 + xl*0.1526913;
+      xl  = (pl0 + pl1 + pl2 + xl*0.0555179)*0.6;
+      pr0 = 0.99765*pr0 + xr*0.0990460;
+      pr1 = 0.96300*pr1 + xr*0.2965164;
+      pr2 = 0.57000*pr2 + xr*0.1526913;
+      xr  = (pr0 + pr1 + pr2 + xr*0.0555179)*0.6;
+    );
+
+    // ---- TPT / ZDF state-variable bandpass, swept per sample -------------
+    g  = tan($pi*fL/srate);
+    a1 = 1/(1 + g*(g + kq)); a2 = g*a1; a3 = g*a2;
+    v3 = xl - ic2L;
+    v1 = a1*ic1L + a2*v3;
+    v2 = ic2L + a2*ic1L + a3*v3;
+    ic1L = 2*v1 - ic1L; ic2L = 2*v2 - ic2L;
+    oL = v1*sq_k;
+
+    g  = tan($pi*fR/srate);
+    a1 = 1/(1 + g*(g + kq)); a2 = g*a1; a3 = g*a2;
+    v3 = xr - ic2R;
+    v1 = a1*ic1R + a2*v3;
+    v2 = ic2R + a2*ic1R + a3*v3;
+    ic1R = 2*v1 - ic1R; ic2R = 2*v2 - ic2R;
+    oR = v1*sq_k;
+
+    // paranoia: catches NaN too, since NaN fails every < comparison
+    (abs(ic1L) < 1000000 && abs(ic2L) < 1000000) ? 0 : ( ic1L = 0; ic2L = 0; );
+    (abs(ic1R) < 1000000 && abs(ic2R) < 1000000) ? 0 : ( ic1R = 0; ic2R = 0; );
+  ) : (
+    // ---- sine sweep ------------------------------------------------------
+    opL += fL/srate;  opL >= 1 ? opL -= 1;
+    opR += fR/srate;  opR >= 1 ? opR -= 1;
+    oL = sin(2*$pi*opL)*0.7;
+    oR = sin(2*$pi*opR)*0.7;
+  );
+
+  oL = sat(oL*env*lvl_s);
+  oR = sat(oR*env*lvl_s);
+
+  num_ch >= 2 ? ( spl0 += oL; spl1 += oR; ) : ( spl0 += (oL + oR)*0.5; );
+);
+
+@gfx 430 152
+gfx_setfont(1,"Arial",15);
+gfx_r = 0.07; gfx_g = 0.08; gfx_b = 0.10; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+gfx_r = 0.90; gfx_g = 0.92; gfx_b = 0.96;
+gfx_x = 12; gfx_y = 8;
+sprintf(#t, "STRYK RISER"); gfx_drawstr(#t);
+
+gfx_r = 0.62; gfx_g = 0.68; gfx_b = 0.78;
+gfx_x = 12; gfx_y = 30;
+sprintf(#t, "%d bars = %.2f s   @ %.2f BPM   %d/%d", bars, bars*bpb*60/max(1,tp), tp, tsn, tsd);
+gfx_drawstr(#t);
+
+bx = 12; by = 54; bw = gfx_w - 24; bh = 30;
+
+gfx_r = 0.16; gfx_g = 0.18; gfx_b = 0.22;
+gfx_rect(bx, by, bw, bh);
+
+// fill walks cyan -> hot orange as the ramp climbs
+gfx_r = 0.15 + 0.85*ph; gfx_g = 0.85 - 0.55*ph; gfx_b = 1 - 0.85*ph;
+gfx_rect(bx, by, max(0, min(bw, bw*ph)), bh);
+
+gfx_r = 0.35; gfx_g = 0.38; gfx_b = 0.44;
+i = 1;
+while (i < bars) (
+  gfx_line(bx + bw*i/bars, by, bx + bw*i/bars, by + bh);
+  i += 1;
+);
+
+gfx_r = 0.75; gfx_g = 0.78; gfx_b = 0.84;
+gfx_line(bx, by, bx + bw, by);
+gfx_line(bx, by + bh, bx + bw, by + bh);
+gfx_line(bx, by, bx, by + bh);
+gfx_line(bx + bw, by, bx + bw, by + bh);
+
+gfx_r = 0.88; gfx_g = 0.90; gfx_b = 0.94;
+gfx_x = 12; gfx_y = 92;
+sprintf(#t, "sweep %.0f Hz    env %.0f%%    peak lands on the next downbeat", fcur, env*100);
+gfx_drawstr(#t);
+
+gfx_r = 0.55; gfx_g = 0.60; gfx_b = 0.70;
+gfx_x = 12; gfx_y = 112;
+mode == 0 ? sprintf(#t, "trigger: follow transport (bar-locked to project position)")
+          : sprintf(#t, "trigger: manual -- flip Manual Fire to FIRE to launch");
+gfx_drawstr(#t);
+
+gfx_x = 12; gfx_y = 130;
+sprintf(#t, "A=432: F#3 181.63  F#4 363.27  F#5 726.54 Hz  (440->432 = -31.77 cents)");
+gfx_drawstr(#t);

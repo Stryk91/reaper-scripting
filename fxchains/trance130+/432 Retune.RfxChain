@@ -1,0 +1,17 @@
+SHOW 0
+LASTSEL 0
+DOCKED 0
+BYPASS 0 0 0
+<JS stryk/stryk_retune432 ""
+0 432 -31.77 40 30 100 0 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {F3A25DA0-A2D5-4B0A-B1DD-299BBD7E4DAF}
+WAK 0 0
+BYPASS 0 0 0
+<JS stryk/stryk_tuner432 ""
+432 -40 0.7 55 1200 2 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {9DDDA6C7-3C2B-4886-8BCC-24D0D903E9C8}
+WAK 0 0

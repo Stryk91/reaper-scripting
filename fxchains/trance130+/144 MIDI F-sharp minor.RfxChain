@@ -1,0 +1,17 @@
+SHOW 0
+LASTSEL 0
+DOCKED 0
+BYPASS 0 0 0
+<JS stryk/stryk_scaleforce ""
+6 0 0 0 0 127 1 432 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {0549CB2F-D3AC-4951-87FD-E6FC452620D4}
+WAK 0 0
+BYPASS 0 0 0
+<JS stryk/stryk_chordgen ""
+6 0 0 0 0 85 0 0 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {8466C299-04D6-48D2-9AE5-BA8FDF28E2E2}
+WAK 0 0

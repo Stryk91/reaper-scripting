@@ -1,0 +1,499 @@
+desc:STRYK LFO Tool - tempo-synced modulation shaper (144 / F#m / A=432 pack)
+//tags: lfo modulation tremolo autopan filter sweep tempo-sync trance utility
+//author: STRYK 144 pack
+
+/* ----------------------------------------------------------------------------
+   STRYK LFO TOOL
+   ----------------------------------------------------------------------------
+   One tempo-locked LFO, four destinations: Volume (tremolo), Pan (auto-pan),
+   Low-Pass Cutoff and High-Pass Cutoff.
+
+   PHASE IS DERIVED FROM beat_position, NOT FROM A FREE COUNTER.
+   Every instance in the project therefore sits on exactly the same grid: put
+   this on the pad, the pluck and the reverb return and they breathe together,
+   in phase, forever - through loops, transport jumps and tempo maps. While the
+   transport rolls the cycle length comes from the host `tempo`, so the tool
+   follows the project BPM. Free-run BPM is used ONLY while the transport is
+   stopped, so the thing can still be auditioned with no playback.
+
+   Session defaults baked in (144 BPM, F# minor, A=432 Hz):
+     Rate      1 bar = 1666.67 ms at 144 BPM in 4/4.
+               The other choices at 144: 4 bars 6666.7 | 2 bars 3333.3 |
+               1/2 833.33 | 1/4 416.667 | 1/8 208.333 | 1/16 104.167 ms.
+               Bar length follows ts_num / ts_denom, it is not assumed 4/4.
+     Shape     Sine, starting at the TOP on the downbeat (cos), so beat 1 is
+               the open/loud/bright point of the cycle - the trance default.
+     Depth     50 %  -> tremolo floor -6.0 dB, pan +/-50 %, filter +/-2 octaves.
+     Phase     0 deg (360 deg = one full cycle of whatever Rate is set to).
+     Smoothing 8 ms  -> rounds the Square and Sample & Hold edges so they do not
+               click, and softens the saw wrap. Square and S&H are floored at
+               1 ms of smoothing internally because 0 ms on a hard edge IS a
+               click, no matter what the slider says.
+     Cutoff    800 Hz. In F# at A=432 that sits just above F#5 = 726.54 Hz, so
+               a +/-2 octave sweep runs 200 Hz .. 3200 Hz - right through the
+               lead register. Other musical picks for this session:
+               F#3 181.63 | F#4 363.27 | F#5 726.54 | F#6 1453.08 Hz.
+     Resonance Q 0.9 - just past Butterworth (0.707). A whisker of bite (about
+               +0.7 dB at the corner), no self-oscillation. Push to 4-8 for the
+               screaming sweep, but be aware that is a real resonant filter:
+               Q 8 is roughly +18 dB at the corner, so pull the Mix or the
+               channel fader or you WILL hit the ceiling on a hot source. No
+               auto-makeup is applied on purpose - it would flatten the sweep.
+     Mix       100 %.
+     FreeBPM   144.
+   A=432 tuning shifts pitch by 12*log2(432/440) = -31.77 cents. Nothing here
+   generates pitch, so 432 only informs the cutoff defaults above.
+
+   Depth mapping per target:
+     Volume  unipolar downward. LFO +1 = unity, LFO -1 = (1 - Depth).
+             100 % Depth = full gate, 50 % = -6.0 dB floor.
+     Pan     bipolar constant-power balance. 100 % Depth = hard L to hard R.
+             Centre is unity gain (not -3 dB) and total power is constant, so
+             the sweep does not pump. On a MONO track Pan is bypassed - there
+             is nowhere to pan to, and modulating the single channel would just
+             be an ugly second tremolo.
+     Filter  bipolar, +/- (Depth * 4) octaves around Base Cutoff. 50 % Depth =
+             +/-2 octaves. Cutoff is hard clamped to 10 Hz .. 0.45 * srate so it
+             can never cross Nyquist, at any samplerate.
+
+   Filter implementation: a real RBJ biquad (12 dB/oct, resonant), in transposed
+   direct form II - the numerically well behaved form for time-varying
+   coefficients. Coefficients are NOT recomputed per sample. They are recomputed
+   at control rate (a segment of min(samplesblock, 64) samples, and always at
+   least once per block) and then LINEARLY INTERPOLATED per sample across the
+   segment, so the sweep is continuous with no zipper and no stair-stepping,
+   at roughly 1/64 of the trig cost. Filter state is flushed on target changes
+   and denormals are killed explicitly since ext_nodenorm is set.
+
+   Sample & Hold is deterministic, not rand(): the held value is a hash of the
+   absolute cycle index taken from beat_position. That means it is identical on
+   every playback, identical in every instance, and it survives looping - a
+   random-per-playthrough S&H is useless for arranging.
+---------------------------------------------------------------------------- */
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+slider1:0<0,3,1{Volume (tremolo),Pan (auto-pan),Low-Pass Cutoff,High-Pass Cutoff}>Target
+slider2:0<0,5,1{Sine,Triangle,Saw Down,Saw Up,Square,Sample & Hold}>Shape
+slider3:2<0,6,1{4 bars (6666.7 ms at 144),2 bars (3333.3 ms at 144),1 bar (1666.7 ms at 144),1/2 (833.3 ms at 144),1/4 beat (416.7 ms at 144),1/8 (208.3 ms at 144),1/16 (104.2 ms at 144)}>Rate
+slider4:50<0,100,0.1>Depth (%)
+slider5:0<0,360,1>Phase Offset (deg - 360 = one full cycle)
+slider6:8<0,200,0.1>Smoothing (ms)
+slider7:800<20,20000,1>Base Cutoff (Hz - filter targets)
+slider8:0.9<0.5,8,0.01>Resonance Q (filter targets)
+slider9:144<40,300,0.01>Free-run BPM (transport stopped)
+slider10:100<0,100,0.1>Mix (%)
+
+@init
+
+ext_nodenorm = 1;
+
+TINY  = 0.000000000001;
+TINYZ = 0.000000000000000001;
+LN2   = 0.693147180559945;
+
+// ------------------------------------------------- one-pole time constant (ms)
+function ms2coef(ms) (
+  ms = max(ms, 0.002);
+  min(1 - exp(-1 / (ms * 0.001 * max(srate, 1))), 1);
+);
+
+// ------------------------------------------------------ deterministic 0..1 hash
+// Folds the cycle index into 0..2^22 first, so negative pre-roll positions and
+// very long projects both stay inside exact double integer range (< 2^53).
+function hash01(n) local(x) (
+  x = floor(n);
+  x = x - floor(x / 4194304) * 4194304;
+  x = x * 1664525 + 1013904223;
+  x = x - floor(x / 4294967296) * 4294967296;
+  x = x * 1664525 + 1013904223;
+  x = x - floor(x / 4294967296) * 4294967296;
+  x / 4294967296;
+);
+
+// ------------------------------------------------- bipolar shape, -1 .. +1
+// p = 0 is the downbeat of the cycle. Sine/Triangle/Saw Down all start at the
+// TOP so beat 1 is open/loud/bright.
+function lfo_shape(p) (
+  p = p - floor(p);
+  shape_i == 0 ? ( cos(2 * $pi * p) ) :
+  ( shape_i == 1 ? ( p < 0.5 ? (1 - 4 * p) : (4 * p - 3) ) :
+  ( shape_i == 2 ? ( 1 - 2 * p ) :
+  ( shape_i == 3 ? ( 2 * p - 1 ) :
+  ( shape_i == 4 ? ( p < 0.5 ? 1 : -1 ) :
+                   ( sh_val ) ) ) ) );
+);
+
+// ------------------------------------------------ refresh the S&H held value
+function sh_check() (
+  cyc_idx != cyc_last ? (
+    cyc_last = cyc_idx;
+    sh_val   = hash01(cyc_idx) * 2 - 1;
+  );
+);
+
+// ------------------------------------------------------- RBJ biquad, into t*
+// hp != 0 -> high pass, else low pass. Writes tb0,tb1,tb2,ta1,ta2 (a0 removed)
+// and publishes the clamped cutoff as fc_now for the display.
+function calc_coef(fc, qq, hp) local(w0, cw, sw, al, a0) (
+  fc = min(max(fc, 10), srate * 0.45);
+  qq = max(qq, 0.05);
+  fc_now = fc;
+  w0 = 2 * $pi * fc / max(srate, 1);
+  cw = cos(w0);
+  sw = sin(w0);
+  al = sw / (2 * qq);
+  a0 = 1 + al;
+  a0 < TINY ? ( a0 = TINY; );
+  hp ? (
+    tb0 =  (1 + cw) * 0.5 / a0;
+    tb1 = -(1 + cw) / a0;
+    tb2 =  tb0;
+  ) : (
+    tb0 = (1 - cw) * 0.5 / a0;
+    tb1 = (1 - cw) / a0;
+    tb2 = tb0;
+  );
+  ta1 = (-2 * cw) / a0;
+  ta2 = (1 - al) / a0;
+);
+
+// ------------------------------- control-rate coefficient update + ramp setup
+// Called at most once per seg_n samples. Sets up per-sample deltas so the
+// running coefficients arrive exactly on target at the end of the segment.
+function seg_update() local(oc, fc) (
+  base_s += seg_sm * (base_t - base_s);
+  q_s    += seg_sm * (q_t    - q_s);
+
+  oc = dep_s * 4 * lfo_s;
+  oc = min(max(oc, -12), 12);
+  fc = base_s * exp(LN2 * oc);
+
+  calc_coef(fc, q_s, target_i == 3);
+
+  filt_prime ? (
+    db0 = (tb0 - cb0) / seg_n;
+    db1 = (tb1 - cb1) / seg_n;
+    db2 = (tb2 - cb2) / seg_n;
+    da1 = (ta1 - ca1) / seg_n;
+    da2 = (ta2 - ca2) / seg_n;
+  ) : (
+    cb0 = tb0; cb1 = tb1; cb2 = tb2; ca1 = ta1; ca2 = ta2;
+    db0 = 0;   db1 = 0;   db2 = 0;   da1 = 0;   da2 = 0;
+    filt_prime = 1;
+  );
+
+  seg_cnt = seg_n;
+);
+
+// ------------------------------------------------------------ slider decoding
+function read_sliders() local(sm_ms) (
+  target_i = min(max(slider1 | 0, 0), 3);
+  shape_i  = min(max(slider2 | 0, 0), 5);
+  rate_i   = min(max(slider3 | 0, 0), 6);
+
+  dep_t = min(max(slider4, 0), 100) * 0.01;
+
+  // 360 degrees = one full LFO cycle, whatever Rate is
+  phase_off = slider5 / 360;
+  phase_off = phase_off - floor(phase_off);
+
+  // hard edges always get at least 1 ms of rounding or they click
+  sm_ms  = min(max(slider6, 0), 200);
+  (shape_i == 4 || shape_i == 5) ? ( sm_ms = max(sm_ms, 1); );
+  sm_lfo = ms2coef(sm_ms);
+
+  base_t = min(max(slider7, 20), 20000);
+  q_t    = min(max(slider8, 0.05), 24);
+
+  free_bpm = min(max(slider9, 20), 999);
+  mix_t    = min(max(slider10, 0), 100) * 0.01;
+);
+
+// --------------------------------------------------------------- boot state
+phase    = 0;
+cyc_idx  = 0;
+cyc_last = -1000000000;
+sh_val   = 0;
+lfo_s    = 1;
+bpm_now  = 144;
+per_sec  = 1.666666666666667;
+
+read_sliders();
+dep_s      = dep_t;
+mix_s      = mix_t;
+base_s     = base_t;
+q_s        = q_t;
+target_p   = target_i;
+sh_check();
+
+phase_inc    = 1 / max(per_sec * max(srate, 1), 1);
+bar_beats    = 4;
+period_beats = 4;
+lfo_g        = 1;
+w0v = 0; w1v = 0;
+
+seg_n      = 64;
+seg_cnt    = 0;
+seg_sm     = 1 - exp(-2 * $pi * 20 * seg_n / max(srate, 1));
+filt_prime = 0;
+fc_now     = base_t;
+
+cb0 = 1; cb1 = 0; cb2 = 0; ca1 = 0; ca2 = 0;
+db0 = 0; db1 = 0; db2 = 0; da1 = 0; da2 = 0;
+z10 = 0; z20 = 0; z11 = 0; z21 = 0;
+
+has_r = 1;
+
+// ~30 Hz one-pole on anything that touches gain, so no zipper
+sm_c = 1 - exp(-2 * $pi * 30 / max(srate, 1));
+
+@slider
+
+read_sliders();
+
+// switching destination must not fire the old filter state into the new one
+target_i != target_p ? (
+  z10 = 0; z20 = 0; z11 = 0; z21 = 0;
+  filt_prime = 0;
+  target_p = target_i;
+);
+
+// force the held value to refresh if S&H was just selected
+cyc_last = -1000000000;
+sh_check();
+
+@block
+
+// ---- bar length from the actual time signature, never assumed 4/4
+bar_beats = (ts_num > 0 && ts_denom > 0) ? (ts_num * 4 / ts_denom) : 4;
+bar_beats = min(max(bar_beats, 0.25), 64);
+
+// ---- cycle length in quarter notes
+rate_i == 0 ? ( period_beats = 4 * bar_beats; ) :
+( rate_i == 1 ? ( period_beats = 2 * bar_beats; ) :
+( rate_i == 2 ? ( period_beats = bar_beats; ) :
+( rate_i == 3 ? ( period_beats = 2; ) :
+( rate_i == 4 ? ( period_beats = 1; ) :
+( rate_i == 5 ? ( period_beats = 0.5; ) :
+                ( period_beats = 0.25; ) ) ) ) ) );
+period_beats = max(period_beats, 0.0001);
+
+play_state & 1 ? (
+  bpm_now = tempo > 1 ? tempo : free_bpm;
+) : (
+  bpm_now = free_bpm;
+);
+bpm_now = min(max(bpm_now, 20), 999);
+
+per_sec   = max(period_beats * 60 / bpm_now, 0.001);
+phase_inc = 1 / max(per_sec * max(srate, 1), 1);
+
+play_state & 1 ? (
+  // rolling: hard-lock phase AND the S&H step index to the project grid,
+  // so every instance agrees on where "1" is, every single block.
+  bpx      = beat_position / period_beats + phase_off;
+  phase    = bpx - floor(bpx);
+  cyc_idx  = floor(bpx);
+  sh_check();
+) : (
+  play_state & 2 ? (
+    phase_inc = 0;    // paused: freeze exactly where we are
+  );
+  // stopped: leave phase alone, @sample free-runs it at Free-run BPM
+);
+
+has_r = num_ch >= 2;
+
+// control-rate segment for the filter coefficients: never longer than a block
+seg_n   = max(min(samplesblock, 64), 1);
+seg_sm  = 1 - exp(-2 * $pi * 20 * seg_n / max(srate, 1));
+seg_cnt = 0;
+
+@sample
+
+// ------------------------------------------------------------------- the LFO
+lfo_r  = lfo_shape(phase);
+lfo_s += sm_lfo * (lfo_r - lfo_s);
+abs(lfo_r - lfo_s) < TINYZ ? ( lfo_s = lfo_r; );
+
+dep_s += sm_c * (dep_t - dep_s);
+mix_s += sm_c * (mix_t - mix_s);
+abs(dep_t - dep_s) < TINYZ ? ( dep_s = dep_t; );
+abs(mix_t - mix_s) < TINYZ ? ( mix_s = mix_t; );
+
+d0 = spl0;
+d1 = has_r ? spl1 : 0;
+
+// input NaN / Inf guard, BEFORE the filter can swallow it into its state
+(d0 > -100000 && d0 < 100000) ? 0 : ( d0 = 0; );
+(d1 > -100000 && d1 < 100000) ? 0 : ( d1 = 0; );
+
+target_i == 0 ? (
+  // ------------------------------------------------------- Volume (tremolo)
+  lfo_g = 1 - dep_s * 0.5 * (1 - lfo_s);
+  lfo_g = min(max(lfo_g, 0), 1);
+  w0v = d0 * lfo_g;
+  w1v = d1 * lfo_g;
+) : ( target_i == 1 ? (
+  // ------------------------------------------------------- Pan (auto-pan)
+  pan_v = min(max(dep_s * lfo_s, -1), 1);
+  p2    = (pan_v + 1) * 0.5;
+  gl    = sqrt(max(2 * (1 - p2), 0));
+  gr    = sqrt(max(2 * p2, 0));
+  has_r ? (
+    w0v = d0 * gl;
+    w1v = d1 * gr;
+  ) : (
+    w0v = d0;   // mono: nowhere to pan to, so pass through untouched
+    w1v = d1;
+  );
+) : (
+  // -------------------------------------- Low-Pass / High-Pass Cutoff sweep
+  seg_cnt <= 0 ? ( seg_update(); );
+  cb0 += db0; cb1 += db1; cb2 += db2; ca1 += da1; ca2 += da2;
+
+  fy0 = cb0 * d0 + z10;
+  z10 = cb1 * d0 - ca1 * fy0 + z20;
+  z20 = cb2 * d0 - ca2 * fy0;
+  abs(z10) < TINYZ ? ( z10 = 0; );
+  abs(z20) < TINYZ ? ( z20 = 0; );
+  w0v = fy0;
+
+  has_r ? (
+    fy1 = cb0 * d1 + z11;
+    z11 = cb1 * d1 - ca1 * fy1 + z21;
+    z21 = cb2 * d1 - ca2 * fy1;
+    abs(z11) < TINYZ ? ( z11 = 0; );
+    abs(z21) < TINYZ ? ( z21 = 0; );
+    w1v = fy1;
+  ) : (
+    w1v = d1;
+  );
+
+  seg_cnt -= 1;
+) );
+
+// NaN / Inf guard: anything that is not equal to itself, or is absurd, is dead
+(w0v > -100000 && w0v < 100000) ? 0 : ( w0v = 0; z10 = 0; z20 = 0; );
+(w1v > -100000 && w1v < 100000) ? 0 : ( w1v = 0; z11 = 0; z21 = 0; );
+
+spl0 = d0 + mix_s * (w0v - d0);
+has_r ? ( spl1 = d1 + mix_s * (w1v - d1); );
+
+// Volume is the only target that means anything on surround / >2 channel tracks
+(target_i == 0 && num_ch > 2) ? (
+  gm = 1 + mix_s * (lfo_g - 1);
+  ci = 2;
+  loop(num_ch - 2,
+    spl(ci) = spl(ci) * gm;
+    ci += 1;
+  );
+);
+
+// --------------------------------------------------------------- advance phase
+phase += phase_inc;
+phase >= 1 ? (
+  phase   = phase - floor(phase);
+  cyc_idx = cyc_idx + 1;
+  sh_check();
+);
+
+@gfx 500 200
+
+gfx_setfont(1, "Arial", 14);
+
+gfx_r = 0.06; gfx_g = 0.07; gfx_b = 0.09; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+px0  = 10;
+py0  = 44;
+pw   = max(gfx_w - 20, 8);
+ph_h = max(gfx_h - 82, 8);
+
+gfx_r = 0.12; gfx_g = 0.13; gfx_b = 0.16;
+gfx_rect(px0, py0, pw, ph_h);
+
+// centre line + cycle divider
+gfx_r = 0.30; gfx_g = 0.32; gfx_b = 0.36;
+gfx_line(px0, py0 + ph_h * 0.5, px0 + pw, py0 + ph_h * 0.5);
+gfx_line(px0 + pw * 0.5, py0, px0 + pw * 0.5, py0 + ph_h);
+
+// two cycles of the shape, scaled by Depth so the slider does something visible
+gfx_r = 0.25; gfx_g = 0.85; gfx_b = 1.0;
+gx = 0; lx = -1; ly = 0;
+loop(pw,
+  cp = (gx / pw) * 2;
+  shape_i == 5 ? (
+    gv = hash01(cyc_idx + floor(cp)) * 2 - 1;
+  ) : (
+    gv = lfo_shape(cp);
+  );
+  gv = gv * dep_s;
+  gy = py0 + (1 - (gv * 0.5 + 0.5)) * ph_h;
+  lx >= 0 ? ( gfx_line(lx, ly, px0 + gx, gy); );
+  lx = px0 + gx; ly = gy;
+  gx += 1;
+);
+
+// playhead + the smoothed value actually being used right now
+gfx_r = 1.0; gfx_g = 0.55; gfx_b = 0.15;
+hx = px0 + (phase - floor(phase)) * pw * 0.5;
+gfx_line(hx, py0, hx, py0 + ph_h);
+hy = py0 + (1 - (min(max(lfo_s * dep_s, -1), 1) * 0.5 + 0.5)) * ph_h;
+gfx_circle(hx, hy, 3, 1, 1);
+
+// ------------------------------------------------------------------- readouts
+target_i == 0 ? ( strcpy(#tn, "Volume") ) :
+( target_i == 1 ? ( strcpy(#tn, "Pan") ) :
+( target_i == 2 ? ( strcpy(#tn, "Low-Pass") ) :
+                  ( strcpy(#tn, "High-Pass") ) ) );
+
+shape_i == 0 ? ( strcpy(#nm, "Sine") ) :
+( shape_i == 1 ? ( strcpy(#nm, "Triangle") ) :
+( shape_i == 2 ? ( strcpy(#nm, "Saw Down") ) :
+( shape_i == 3 ? ( strcpy(#nm, "Saw Up") ) :
+( shape_i == 4 ? ( strcpy(#nm, "Square") ) :
+                 ( strcpy(#nm, "Sample & Hold") ) ) ) ) );
+
+rate_i == 0 ? ( strcpy(#rn, "4 bars") ) :
+( rate_i == 1 ? ( strcpy(#rn, "2 bars") ) :
+( rate_i == 2 ? ( strcpy(#rn, "1 bar") ) :
+( rate_i == 3 ? ( strcpy(#rn, "1/2") ) :
+( rate_i == 4 ? ( strcpy(#rn, "1/4") ) :
+( rate_i == 5 ? ( strcpy(#rn, "1/8") ) :
+                ( strcpy(#rn, "1/16") ) ) ) ) ) );
+
+gfx_r = 0.86; gfx_g = 0.89; gfx_b = 0.93;
+gfx_x = px0; gfx_y = 8;
+sprintf(#s, "%s  <-  %s  %s   %.1f ms   %.2f BPM", #tn, #nm, #rn, per_sec * 1000, bpm_now);
+gfx_drawstr(#s);
+
+gfx_r = 0.55; gfx_g = 0.60; gfx_b = 0.66;
+gfx_x = px0; gfx_y = 25;
+play_state & 1 ? (
+  sprintf(#s, "GRID LOCKED to beat_position   phase %.0f deg   %.2f beats/cycle", slider5, period_beats);
+) : (
+  sprintf(#s, "FREE RUN at %.2f BPM (transport stopped)   %.2f beats/cycle", free_bpm, period_beats);
+);
+gfx_drawstr(#s);
+
+gfx_r = 0.80; gfx_g = 0.84; gfx_b = 0.88;
+gfx_x = px0; gfx_y = gfx_h - 22;
+target_i == 0 ? (
+  sprintf(#s, "gain %.1f dB   floor %.1f dB   mix %.0f%%",
+    20 * log10(max(1 - dep_s * 0.5 * (1 - lfo_s), 0.0000158)),
+    20 * log10(max(1 - dep_s, 0.0000158)), mix_s * 100);
+) : ( target_i == 1 ? (
+  sprintf(#s, "pan %.0f  (-100 hard left / 100 hard right)   mix %.0f%%",
+    min(max(dep_s * lfo_s, -1), 1) * 100, mix_s * 100);
+) : (
+  sprintf(#s, "cutoff %.0f Hz   Q %.2f   span %.0f - %.0f Hz   mix %.0f%%",
+    fc_now, q_s,
+    max(base_s * exp(LN2 * -dep_s * 4), 10),
+    min(base_s * exp(LN2 * dep_s * 4), srate * 0.45), mix_s * 100);
+) );
+gfx_drawstr(#s);

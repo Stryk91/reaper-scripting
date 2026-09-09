@@ -1,0 +1,217 @@
+desc:STRYK Transient Shaper (attack/sustain, 144 pack)
+//tags: dynamics transient shaper attack sustain punch pluck kick stab
+//author: STRYK 144 pack
+
+/*
+  STRYK Transient Shaper
+  ----------------------
+  Classic two-envelope-follower attack/sustain designer for plucks, kicks and stabs.
+
+  How it works (no feedback anywhere, so it cannot self-oscillate):
+    detector  = max(|L|,|R|)                        <- one detector, one gain, stereo stays put
+    ATTACK    : a FAST-attack follower vs a SLOW-attack follower on that same rectified signal.
+                On a transient the fast one leaps ahead of the slow one; the dB difference
+                between them (fast/slow) is the attack signal. x Attack% = boost or cut.
+    SUSTAIN   : a SHORT-release follower vs a LONG-release follower. In the decay region the
+                long one sits above the short one; that dB difference is the sustain signal.
+                x Sustain% = fatten the tail (+) or tighten/dry it out (-).
+    Both paths are soft-gated at ~-60 dBFS (env/(env+0.001)) so the noise floor between notes
+    never gets pumped. Total gain is clamped to +/-24 dB and smoothed with a 0.3 ms one-pole,
+    so it is click-free; Output and Mix are smoothed at 20 ms so slider moves never zipper.
+
+  Session defaults (144 BPM, F# , A=432 Hz):
+    This is a LEVEL-domain processor - no oscillators, no filters, no pitch - so A=432 tuning
+    (-31.77 cents, F#4 = 363.27 Hz) does not change a single coefficient here. Nothing is
+    hardcoded to 144 either; the only tempo touch is `tempo` read in @block for the readout,
+    so it follows the project.
+    The TIMES are what got picked for a 144 BPM grid (beat = 416.667 ms, 1/16 = 104.167 ms,
+    1/32 = 52.08 ms, 1/64 = 26.04 ms):
+      Fast attack 1 ms   - fast enough to catch a pluck/kick edge, slow enough not to rectify.
+      Slow attack 40 ms  - sits between a 1/64 and a 1/32 at 144, i.e. comfortably INSIDE a
+                           1/16 note (104 ms), so 16th-note plucks each get their own transient
+                           instead of one long smear.
+      Releases are derived from Slow attack: attack pair = max(2x, 50 ms); sustain pair =
+      max(1x, 30 ms) short vs max(8x, 300 ms) long (300 ms ~ 3/4 of a 144 BPM beat).
+      Attack +30% / Sustain -15% = punchy, slightly dried-out plucks straight off the insert.
+
+  Listen = "Envelope Difference": you hear ONLY what the shaper is adding or removing
+  (wet minus dry, i.e. dry * (gain-1)). Silence = the shaper is doing nothing. Mix is bypassed
+  in this mode; Output still applies.
+*/
+
+slider1:18<-100,100,1>Attack (%)
+slider2:-15<-100,100,1>Sustain (%)
+slider3:1<0.1,20,0.01>Fast Attack Follower (ms)
+slider4:40<5,200,0.5>Slow Attack Follower (ms)
+slider5:-1.5<-24,24,0.1>Output (dB)
+slider6:0<0,1,1{Off,Envelope Difference}>Listen
+slider7:100<0,100,0.5>Mix (% wet)
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+@init
+
+  ext_nodenorm = 1;
+
+  // ---- helpers -----------------------------------------------------------
+  // one-pole coefficient for a time constant in milliseconds (always 0<c<=1)
+  function ms2coef(ms) (
+    ms = max(ms, 0.005);
+    1 - exp(-1 / (0.001 * ms * srate));
+  );
+
+  function db2gain(db) (
+    exp(db * 0.11512925464970229);   // ln(10)/20
+  );
+
+  // recompute everything that depends on sliders OR samplerate
+  function setcoefs() (
+    cfastatk = ms2coef(slider3);
+    cslowatk = ms2coef(slider4);
+    crela    = ms2coef(max(slider4 * 2, 50));    // shared release, attack pair
+
+    csusatk  = ms2coef(10);                      // both sustain followers, same attack
+    csusrelf = ms2coef(max(slider4, 30));        // short release
+    csusrels = ms2coef(max(slider4 * 8, 300));   // long release
+
+    cgain    = ms2coef(0.3);                     // gain smoother - click-free, no smear
+    cparm    = ms2coef(20);                      // Output / Mix smoothers
+    cdisp    = ms2coef(60);                      // meter ballistics
+
+    atkamt   = slider1 * 0.01;
+    susamt   = slider2 * 0.01;
+    outtar   = db2gain(slider5);
+    mixtar   = slider7 * 0.01;
+    listenmode = slider6 | 0;
+  );
+
+  // ---- constants ---------------------------------------------------------
+  dbconv     = 8.6858896380650366;               // 20/ln(10)
+  ln10_20    = 0.11512925464970229;              // ln(10)/20
+  tiny       = 0.000000001 * 0.000000001;        // 1e-18 - denormal + div-by-zero guard
+  noisefloor = 0.001;                            // -60 dBFS soft gate pivot
+  atkscale   = 1.6;                              // dB of boost per dB of attack difference @100%
+  susscale   = 1.0;                              // dB of change per dB of sustain difference @100%
+  maxdb      = 24;
+
+  // ---- state -------------------------------------------------------------
+  envf = 0; envs = 0; envsf = 0; envss = 0;
+  gsm = 1; gdisp = 0; curbpm = 120;
+
+  setcoefs();
+  outsm = outtar;
+  mixsm = mixtar;
+
+@slider
+
+  setcoefs();
+
+@block
+
+  curbpm = tempo;   // display only - nothing in the DSP is tempo locked
+
+@sample
+
+  d = max(abs(spl0), abs(spl1)) + tiny;
+
+  // --- attack pair: fast vs slow ATTACK, shared release
+  cf = d > envf ? cfastatk : crela;
+  envf = envf + cf * (d - envf);
+  cf = d > envs ? cslowatk : crela;
+  envs = envs + cf * (d - envs);
+
+  // --- sustain pair: shared attack, short vs long RELEASE
+  cf = d > envsf ? csusatk : csusrelf;
+  envsf = envsf + cf * (d - envsf);
+  cf = d > envss ? csusatk : csusrels;
+  envss = envss + cf * (d - envss);
+
+  // --- attack gain
+  ga = 0;
+  atkamt != 0 ? (
+    rr = (envf + tiny) / (envs + tiny);
+    rr > 1.000001 ? (
+      da = min(dbconv * log(rr), maxdb);
+      ga = atkamt * da * atkscale * (envs / (envs + noisefloor));
+    );
+  );
+
+  // --- sustain gain
+  gs = 0;
+  susamt != 0 ? (
+    rr = (envss + tiny) / (envsf + tiny);
+    rr > 1.000001 ? (
+      ds = min(dbconv * log(rr), maxdb);
+      gs = susamt * ds * susscale * (envss / (envss + noisefloor));
+    );
+  );
+
+  gdb   = min(max(ga + gs, -maxdb), maxdb);
+  gtar  = exp(gdb * ln10_20);
+  gsm   = gsm + cgain * (gtar - gsm);
+  gdisp = gdisp + cdisp * (gdb - gdisp);
+
+  outsm = outsm + cparm * (outtar - outsm);
+  mixsm = mixsm + cparm * (mixtar - mixsm);
+
+  // --- output. Same gain both channels: the stereo image never shifts.
+  dry0 = spl0;
+  dry1 = spl1;
+  df0 = dry0 * (gsm - 1);     // wet - dry
+  df1 = dry1 * (gsm - 1);
+
+  listenmode > 0 ? (
+    spl0 = df0 * outsm;
+    spl1 = df1 * outsm;
+  ) : (
+    spl0 = (dry0 + df0 * mixsm) * outsm;
+    spl1 = (dry1 + df1 * mixsm) * outsm;
+  );
+
+@gfx 420 118
+
+  gfx_setfont(1, "Arial", 15);
+
+  gfx_r = 0.07; gfx_g = 0.075; gfx_b = 0.09; gfx_a = 1;
+  gfx_rect(0, 0, gfx_w, gfx_h);
+
+  mx = 18;
+  mw = max(gfx_w - 36, 40);
+  mh = 22;
+  my = gfx_h * 0.45;
+  cx = mx + mw * 0.5;
+
+  gfx_r = 0.15; gfx_g = 0.16; gfx_b = 0.2;
+  gfx_rect(mx, my, mw, mh);
+
+  v  = min(max(gdisp, -maxdb), maxdb) / maxdb;
+  bw = abs(v) * mw * 0.5;
+  v >= 0 ? (
+    gfx_r = 0.15; gfx_g = 0.82; gfx_b = 0.55;
+    gfx_rect(cx, my, bw, mh);
+  ) : (
+    gfx_r = 0.95; gfx_g = 0.42; gfx_b = 0.25;
+    gfx_rect(cx - bw, my, bw, mh);
+  );
+
+  gfx_r = 0.55; gfx_g = 0.58; gfx_b = 0.66;
+  gfx_line(cx, my - 5, cx, my + mh + 5);
+
+  gfx_r = 0.80; gfx_g = 0.83; gfx_b = 0.90;
+  gfx_x = mx; gfx_y = my - 24;
+  sprintf(#s, "Gain %+.1f dB      Attack %+.0f%%   Sustain %+.0f%%", gdisp, slider1, slider2);
+  gfx_drawstr(#s);
+
+  gfx_r = 0.55; gfx_g = 0.58; gfx_b = 0.66;
+  gfx_x = mx; gfx_y = my + mh + 10;
+  sprintf(#s, "%.1f BPM   fast %.2f ms / slow %.1f ms   mix %.0f%%", curbpm, slider3, slider4, slider7);
+  gfx_drawstr(#s);
+
+  listenmode > 0 ? (
+    gfx_r = 0.95; gfx_g = 0.75; gfx_b = 0.25;
+    gfx_x = mx; gfx_y = 6;
+    gfx_drawstr("LISTEN: envelope difference (wet - dry)");
+  );

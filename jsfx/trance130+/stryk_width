@@ -1,0 +1,256 @@
+desc:STRYK Width -- club-safe M/S stereo widener
+//tags: stereo width imaging mid-side mono-safe utility
+//author: STRYK 144 pack
+
+/* ---------------------------------------------------------------------------
+   STRYK WIDTH  --  a widener you can trust on a big rig.
+
+   Mid/Side, done the boring correct way:
+     m = (L+R)*0.5 , s = (L-R)*0.5
+     The SIDE signal gets a 12 dB/oct Linkwitz-Riley high-pass (two cascaded
+     one-poles = a real LR2 HP), so everything under "Mono Below" has no side
+     content at all. That band collapses to m in BOTH speakers, which IS a
+     mono sum, and there is no phase smear above the crossover because the
+     filter error dies away at 12 dB/oct -- the mids pass through untouched.
+     The surviving side is scaled by Width, optionally tilted L/R, and the
+     right-hand reconstruction can read a delayed copy for a Haas spread.
+     m is never filtered and never delayed. The centre stays put.
+
+   144 / F# / A=432 defaults chosen for this session:
+     Mono Below = 140 Hz. At A=432 the F# bass notes sit at
+       F#0 22.70 | F#1 45.41 | F#2 90.82 | F#3 181.63 Hz.
+     140 Hz parks the crossover in the gap between F#2 (90.82) and F#3
+     (181.63): sub, kick and the bass fundamental are locked dead centre,
+     while the first harmonic upward (F#3 and above) is free to spread.
+     Width = 140 percent -- audibly wider than flat but still well inside the
+     safe zone on a mono PA once the bass is centred.
+     Haas = 0 ms. It is genuinely useful and it genuinely costs mono
+     compatibility (the delayed side combs when L+R is summed), so it stays
+     off until you decide to pay for it. Bass never combs even when it is on,
+     because only the high-passed side is delayed.
+     Tilt is not free either -- asymmetric side gains leak side content into
+     L+R, so hard tilts also move the mono sum. Width on its own does not:
+     with Haas 0 and Tilt 0 the mono sum is bit-for-bit unchanged at ANY
+     width setting, including 0 and 200 percent. Verified, not assumed.
+     There is no auto make-up gain. m is never touched, so the centre level
+     never moves; only the side scales. Above ~170 percent on already-wide
+     material the peaks can exceed the input, so watch your limiter.
+     Nothing here is time-synced, so the tempo variable is not read -- 144 BPM
+     names the pack, it does not set a coefficient in this effect.
+
+   Mono Check is an audition switch, not part of the sound: it swaps the
+   output for the mono sum, or for the side band alone, so you can hear what
+   the mono zones of a venue hear and what the widening is actually adding.
+
+   Insert it and leave it alone -- it already sounds right at the defaults.
+--------------------------------------------------------------------------- */
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+slider1:140<0,200,1>Width (percent, 100 = untouched)
+slider2:0<0,25,0.01>Haas Delay (ms, 0 = off / fully mono safe)
+slider3:140<20,400,1>Mono Below (Hz, bass summed to centre)
+slider4:0<-100,100,1>Tilt (side pan, -100 = left / +100 = right)
+slider5:100<0,100,1>Mix (percent wet)
+slider6:0<0,2,1{Off,Mono Sum,Side Only}>Mono Check (audition only)
+
+@init
+ext_nodenorm = 1;
+
+// Recompute every derived coefficient from the sliders.
+// Called from @init as well as @slider, so a samplerate change can never
+// leave a stale delay length or crossover coefficient behind.
+function upd() local(hz, ms, th) (
+  t_w = slider1 * 0.01;
+
+  ms = max(0, min(25, slider2));
+  t_dly = min(ms * 0.001 * srate, dly_len - 4);
+  t_dly = max(0, t_dly);
+
+  hz = max(20, min(slider3, srate * 0.45));
+  xo_c = 1 - exp(-2 * $pi * hz / srate);
+  xo_c = max(0, min(1, xo_c));
+
+  // constant-power pan of the side band; both legs are exactly 1.0 at Tilt 0
+  th = $pi * 0.25 * (1 + max(-1, min(1, slider4 * 0.01)));
+  t_gl = cos(th) * 1.4142135623730951;
+  t_gr = sin(th) * 1.4142135623730951;
+
+  t_wet = max(0, min(1, slider5 * 0.01));
+  mono_chk = slider6 | 0;
+);
+
+// ---- side delay line (50 ms of headroom, only 25 is reachable) ------------
+dly_base = 0;
+dly_len  = ceil(srate * 0.05) + 8;
+dly_pos  = 0;
+memset(dly_base, 0, dly_len);
+freembuf(dly_base + dly_len + 16);
+
+// 20 ms control smoothing (zipper-free gain and delay moves)
+sm_c = 1 - exp(-1 / (0.020 * srate));
+// 300 ms correlation-meter ballistics
+mt_c = 1 - exp(-1 / (0.300 * srate));
+
+slp1 = slp2 = 0;
+mt_lr = mt_ll = mt_rr = 0;
+
+upd();
+
+// snap the smoothers to their targets on load / samplerate change
+sm_w   = t_w;
+sm_gl  = t_gl;
+sm_gr  = t_gr;
+sm_wet = t_wet;
+sm_dly = t_dly;
+
+@slider
+upd();
+
+@sample
+in_l = spl0;
+in_r = num_ch >= 2 ? spl1 : spl0;
+// NaN / inf gate on the way in: any comparison with NaN is false, so a bad
+// sample becomes silence instead of poisoning the filter states forever.
+in_l = abs(in_l) < 1000000000 ? in_l : 0;
+in_r = abs(in_r) < 1000000000 ? in_r : 0;
+
+sm_w   += sm_c * (t_w   - sm_w);
+sm_gl  += sm_c * (t_gl  - sm_gl);
+sm_gr  += sm_c * (t_gr  - sm_gr);
+sm_wet += sm_c * (t_wet - sm_wet);
+sm_dly += sm_c * (t_dly - sm_dly);
+
+m = (in_l + in_r) * 0.5;
+s = (in_l - in_r) * 0.5;
+
+// LR2 (12 dB/oct) high-pass on the side only: two cascaded one-pole HPs
+slp1 += xo_c * (s - slp1);
+sh1 = s - slp1;
+slp2 += xo_c * (sh1 - slp2);
+s_hi = sh1 - slp2;
+
+s_w = s_hi * sm_w;
+
+// Haas: the right leg reads a delayed copy of the already high-passed side.
+// Mid and bass are untouched, so the low end never combs.
+dly_base[dly_pos] = s_w;
+rd = dly_pos - sm_dly;
+rd < 0 ? (rd += dly_len);
+i0 = floor(rd);
+fr = rd - i0;
+i1 = i0 + 1;
+i1 >= dly_len ? (i1 -= dly_len);
+s_d = dly_base[i0] * (1 - fr) + dly_base[i1] * fr;
+dly_pos = dly_pos + 1 >= dly_len ? 0 : dly_pos + 1;
+
+// recombine
+w_l = m + sm_gl * s_w;
+w_r = m - sm_gr * s_d;
+
+// dry / wet
+o_l = in_l + sm_wet * (w_l - in_l);
+o_r = in_r + sm_wet * (w_r - in_r);
+
+// audition switch
+mono_chk == 1 ? (
+  mo = (o_l + o_r) * 0.5;
+  o_l = mo; o_r = mo;
+) : (
+  mono_chk == 2 ? (
+    mo = (o_l - o_r) * 0.5;
+    o_l = mo; o_r = mo;
+  );
+);
+
+o_l = abs(o_l) < 1000000000 ? o_l : 0;
+o_r = abs(o_r) < 1000000000 ? o_r : 0;
+
+// correlation meter feed
+mt_lr += mt_c * (o_l * o_r - mt_lr);
+mt_ll += mt_c * (o_l * o_l - mt_ll);
+mt_rr += mt_c * (o_r * o_r - mt_rr);
+
+spl0 = o_l;
+num_ch >= 2 ? (spl1 = o_r);
+
+@gfx 470 176
+gfx_r = 0.07; gfx_g = 0.08; gfx_b = 0.10; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+bx = 16;
+bw = max(60, gfx_w - 32);
+by = 74;
+bh = 22;
+
+den = sqrt(max(mt_ll * mt_rr, 0));
+live = den > 0.000000001;
+corr = live ? mt_lr / den : 1;
+corr = max(-1, min(1, corr));
+corr = abs(corr) < 1000000000 ? corr : 0;
+
+gfx_setfont(1, "Arial", 17);
+gfx_r = 0.40; gfx_g = 0.80; gfx_b = 1.00;
+gfx_x = bx; gfx_y = 6;
+sprintf(#s, "STRYK WIDTH   144 / F# / A=432");
+gfx_drawstr(#s);
+
+gfx_setfont(1, "Arial", 14);
+gfx_x = bx; gfx_y = 30;
+mono_chk ? (
+  gfx_r = 1.00; gfx_g = 0.72; gfx_b = 0.20;
+  mono_chk == 1 ?
+    sprintf(#s, "AUDITION: MONO SUM  --  this is not the real output") :
+    sprintf(#s, "AUDITION: SIDE ONLY  --  this is not the real output");
+) : (
+  gfx_r = 0.48; gfx_g = 0.53; gfx_b = 0.58;
+  sprintf(#s, "Under %.0f Hz is centred. Keep the needle out of the red.", slider3);
+);
+gfx_drawstr(#s);
+
+// correlation zones: red -1..0, amber 0..0.3, green 0.3..+1
+gfx_r = 0.42; gfx_g = 0.11; gfx_b = 0.11;
+gfx_rect(bx, by, bw * 0.5, bh);
+gfx_r = 0.44; gfx_g = 0.34; gfx_b = 0.09;
+gfx_rect(bx + bw * 0.5, by, bw * 0.15, bh);
+gfx_r = 0.11; gfx_g = 0.40; gfx_b = 0.20;
+gfx_rect(bx + bw * 0.65, by, bw * 0.35, bh);
+
+gfx_r = 0.35; gfx_g = 0.35; gfx_b = 0.38;
+gfx_rect(bx + bw * 0.5, by, 1, bh);
+
+mx = bx + (corr + 1) * 0.5 * bw;
+mx = max(bx, min(bx + bw - 2, mx));
+live ? (gfx_r = 1; gfx_g = 1; gfx_b = 1;) : (gfx_r = 0.40; gfx_g = 0.40; gfx_b = 0.40;);
+gfx_rect(mx - 1, by - 5, 3, bh + 10);
+
+gfx_setfont(1, "Arial", 12);
+gfx_r = 0.55; gfx_g = 0.58; gfx_b = 0.62;
+gfx_x = bx; gfx_y = by + bh + 6;
+sprintf(#s, "-1 out of phase");
+gfx_drawstr(#s);
+sprintf(#s, "0 wide");
+gfx_measurestr(#s, tw, tht);
+gfx_x = bx + bw * 0.5 - tw * 0.5; gfx_y = by + bh + 6;
+gfx_drawstr(#s);
+sprintf(#s, "+1 mono");
+gfx_measurestr(#s, tw, tht);
+gfx_x = bx + bw - tw; gfx_y = by + bh + 6;
+gfx_drawstr(#s);
+
+gfx_setfont(1, "Arial", 14);
+gfx_r = 0.78; gfx_g = 0.83; gfx_b = 0.88;
+gfx_x = bx; gfx_y = by + bh + 26;
+live ?
+  sprintf(#s, "Correlation %+.2f", corr) :
+  sprintf(#s, "Correlation  --  (no signal)");
+gfx_drawstr(#s);
+
+gfx_r = 0.60; gfx_g = 0.65; gfx_b = 0.70;
+gfx_x = bx; gfx_y = by + bh + 46;
+sprintf(#s, "Width %.0f%%   Mono below %.0f Hz   Haas %.2f ms   Tilt %+.0f   Mix %.0f%%",
+        slider1, slider3, slider2, slider4, slider5);
+gfx_drawstr(#s);

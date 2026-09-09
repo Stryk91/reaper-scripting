@@ -1,0 +1,24 @@
+SHOW 0
+LASTSEL 0
+DOCKED 0
+BYPASS 0 0 0
+<JS stryk/stryk_riser ""
+4 1 200 12000 3 0.3 -12 60 0 0 80 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {21075859-0ACF-497D-8C6F-AF4AA764590F}
+WAK 0 0
+BYPASS 0 0 0
+<JS stryk/stryk_syncdelay ""
+1 2 38 1 7000 180 28 100 25 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {E580CD25-F61B-424A-87EB-498EB8239A1A}
+WAK 0 0
+BYPASS 0 0 0
+<JS stryk/stryk_width ""
+140 0 140 0 100 0 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {99C18141-9A19-4FCB-94E9-F9F1DC6838A9}
+WAK 0 0

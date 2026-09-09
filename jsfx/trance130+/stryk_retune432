@@ -1,0 +1,233 @@
+desc:STRYK Retune 432 (A=440 -> A=432 concert-pitch shifter)
+//tags: pitch tuning retune 432 concert pitch utility stereo
+//author: STRYK 144 pack
+
+/* ---------------------------------------------------------------------------
+   STRYK RETUNE 432 - concert-pitch retuner
+   Pitch only. Tempo and timing are untouched, so it drops straight onto a
+   144 BPM master / bus / instrument without moving a single transient in time.
+
+   SESSION DEFAULTS (144 BPM / F# / A=432)
+     Tuning Mode ... Use Reference Hz
+     Reference Hz .. 432.00  ->  1200*log2(432/440) = -31.77 cents
+     Cents ......... -31.77  (auto-filled + live readout while in Hz mode)
+     Window ms ..... 40      ->  ~3.6 cycles of F#2 (90.82 Hz at A=432), so the
+                                 bass and sub survive the grain crossfade
+     Crossfade ..... 30 %    of the window (see below)
+     Dry/Wet ....... 100 %   (a retuner is a replace, not a parallel FX)
+   F# at A=432 (Hz): F#0 22.70 | F#1 45.41 | F#2 90.82 | F#3 181.63
+                     F#4 363.27 | F#5 726.54 | F#6 1453.08 | F#7 2906.16
+   General: f(midi) = ref * 2^((midi-69)/12).  F#4 = midi 66.
+
+   HOW IT WORKS
+   Classic 2-tap crossfaded delay-line shifter, one delay line per channel,
+   written at 1 sample per sample. Two read taps sit exactly half a window apart
+   and slide through the buffer at (1 - 2^(cents/1200)) samples per sample --
+   negative cents means the taps fall behind the write head, which is the pitch
+   drop. When a tap runs off the end of its window it jumps back by one whole
+   window; a raised-cosine pair (g1 + g2 = 1 at all times) has already faded that
+   tap to silence by then, so the splice is inaudible. No click, ever.
+   Reads are 4-point cubic (Catmull-Rom) interpolated, so the tiny -31.77 cent
+   shift stays clean right up top.
+
+   CROSSFADE %: 100 % = the textbook full-cycle raised cosine (always fading
+   between both taps). Lower values hold a single tap flat through the middle of
+   the window and only raise the cosine near the splice -- so for most of the
+   time you hear ONE clean delay tap and none of the two-tap comb. At 30 % with
+   the defaults, the taps only wrap every ~2.2 s and only ~0.6 s of that is
+   crossfaded, which is why this stays transparent on tonal trance material.
+
+   Exactly 0.00 cents collapses to a SINGLE tap (no comb, no two-tap flange).
+   It is NOT a bit-exact bypass though: the tap freezes wherever it happened to
+   be, so a fixed 2..(2+window) sample delay remains. Phase-coherent, just late
+   -- worth knowing when A/B-ing against bypass.
+
+   NOTES
+   - No tempo sync anywhere, deliberately: retuning is tempo independent. The
+     @gfx footer just reports the host `tempo` for reference.
+   - Dry/Wet under 100 % mixes a slowly time-varying delay against dry, i.e.
+     flanging. Creative option, not a bug. Leave it at 100 to just retune.
+   - Delay is time-varying, so no PDC is reported (there is no fixed latency to
+     report). Wet is roughly 2..(2+window) samples late.
+--------------------------------------------------------------------------- */
+
+slider1:0<0,1,1{Use Reference Hz,Use Cents}>Tuning Mode
+slider2:432<400,460,0.01>Reference Hz (A4)
+slider3:-31.77<-100,100,0.01>Cents (readout / manual override)
+slider4:40<10,80,0.5>Window ms (grain size / formant feel)
+slider5:30<10,100,1>Crossfade (% of window)
+slider6:100<0,100,0.1>Dry / Wet (% wet)
+slider7:0<-12,12,0.1>Output Trim (dB)
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+@init
+ext_nodenorm = 1;
+
+// ---- 4-point, 3rd-order Catmull-Rom read from a power-of-two ring buffer ----
+function cubic4(base, msk, pos) local(i, f, ym1, y0, y1, y2, c1, c2, c3) (
+  i   = pos|0;
+  f   = pos - i;
+  ym1 = base[(i - 1) & msk];
+  y0  = base[i & msk];
+  y1  = base[(i + 1) & msk];
+  y2  = base[(i + 2) & msk];
+  c1  = 0.5 * (y1 - ym1);
+  c2  = ym1 - 2.5*y0 + 2*y1 - 0.5*y2;
+  c3  = 0.5 * (y2 - ym1) + 1.5 * (y0 - y1);
+  ((c3*f + c2)*f + c1)*f + y0;
+);
+
+// ---- every slider-derived target in one place (called by @init and @slider) --
+function recalc() (
+  ref_hz = max(1, slider2);
+  slider1 < 0.5 ? (
+    cents_eff = 1200 * log(ref_hz / 440) / log(2);
+  ) : (
+    cents_eff = slider3;
+    ref_hz    = 440 * pow(2, cents_eff / 1200);
+  );
+  ratio  = pow(2, cents_eff / 1200);
+  drate  = 1 - ratio;                             // delay growth, samples/sample
+  win_t  = max(8, min(slider4 * 0.001 * srate, bufsize - 16));
+  xf_p   = max(0.02, min(slider5 * 0.005, 0.5));  // 100% -> 0.5 = full cosine
+  wet_t  = min(max(slider6 * 0.01, 0), 1);
+  dry_t  = 1 - wet_t;
+  trim_t = pow(10, slider7 / 20);
+  uni_t  = abs(cents_eff) < 0.02 ? 1 : 0;         // collapse to a single tap
+);
+
+// ---- buffer: 100 ms (headroom over the 80 ms max window), rounded up to 2^n --
+need    = ceil(srate * 0.100) + 16;
+need    = min(max(need, 1024), 1048576);
+bufsize = 1024;
+while(bufsize < need) ( bufsize = bufsize * 2; );
+mask = bufsize - 1;
+bufL = 0;
+bufR = bufsize;
+freembuf(bufR + bufsize);
+memset(bufL, 0, bufsize * 2);
+
+wp      = 0;
+phase   = 0;
+g1      = 1;
+g2      = 0;
+smoothc = 1 - exp(-2 * $pi * 20 / srate);         // ~8 ms control smoothing
+
+recalc();
+win_s = win_t; wet_s = wet_t; dry_s = dry_t; trim_s = trim_t; uni_s = uni_t;
+ws    = max(win_s, 8);                            // @gfx reads ws, and it must
+                                                  // be sane before audio runs
+
+@slider
+recalc();
+// mirror the computed cents onto the Cents slider so it reads out live
+(slider1 < 0.5) && (cents_eff > -99.99) && (cents_eff < 99.99) && (abs(slider3 - cents_eff) > 0.005) ? (
+  slider3 = cents_eff;
+  sliderchange(slider3);
+);
+
+@sample
+// --- smooth everything that could click ---
+win_s  += smoothc * (win_t  - win_s);
+dry_s  += smoothc * (dry_t  - dry_s);
+wet_s  += smoothc * (wet_t  - wet_s);
+trim_s += smoothc * (trim_t - trim_s);
+uni_s  += smoothc * (uni_t  - uni_s);
+
+ws = max(win_s, 8);                               // never divide by zero
+
+// --- slide the tap pair through the window (wraps in both directions) ---
+phase += drate / ws;
+phase -= floor(phase);
+ph2 = phase + 0.5;
+ph2 >= 1 ? ( ph2 -= 1; );
+
+// --- raised-cosine crossfade, zero gain exactly at each tap's splice ---
+dph = min(phase, 1 - phase);                      // distance to tap A's splice
+dph >= xf_p ? (
+  w1 = 1;                                         // tap A alone, tap B splicing
+) : (
+  w1 = 0.5 - 0.5 * cos($pi * dph / xf_p);
+);
+w2 = 1 - w1;
+g1 = w1 + uni_s * (1 - w1);                       // uni_s = 1 -> g1 = 1, g2 = 0
+g2 = w2 * (1 - uni_s);                            // g1 + g2 stays 1 either way
+
+// --- write, then read two taps at least 2 samples behind the write head ---
+bufL[wp] = spl0;
+bufR[wp] = spl1;
+
+rp1 = wp + bufsize - (2 + phase * ws);
+
+g2 > 0.0000001 ? (
+  rp2 = wp + bufsize - (2 + ph2 * ws);
+  yl  = g1 * cubic4(bufL, mask, rp1) + g2 * cubic4(bufL, mask, rp2);
+  yr  = g1 * cubic4(bufR, mask, rp1) + g2 * cubic4(bufR, mask, rp2);
+) : (
+  yl = g1 * cubic4(bufL, mask, rp1);
+  yr = g1 * cubic4(bufR, mask, rp1);
+);
+
+spl0 = (dry_s * spl0 + wet_s * yl) * trim_s;
+spl1 = (dry_s * spl1 + wet_s * yr) * trim_s;
+
+wp = (wp + 1) & mask;
+
+@gfx 470 200
+gfx_a = 1;
+gfx_r = 0.07; gfx_g = 0.08; gfx_b = 0.11;
+gfx_rect(0, 0, gfx_w, gfx_h);
+gfx_setfont(1, "Arial", 15);
+
+dr   = max(abs(drate), 0.0000001);
+wrap = ws / dr / srate;
+wms  = ws * 1000 / srate;
+
+gfx_r = 0.45; gfx_g = 0.85; gfx_b = 1.00;
+gfx_x = 12; gfx_y = 10;
+sprintf(#s, "RETUNE    A4 = %.2f Hz    %+.2f cents", ref_hz, cents_eff);
+gfx_drawstr(#s);
+
+gfx_r = 0.80; gfx_g = 0.84; gfx_b = 0.90;
+gfx_x = 12; gfx_y = 34;
+sprintf(#s, "ratio %.6f   (a 440.00 Hz input comes out at %.2f Hz)", ratio, 440 * ratio);
+gfx_drawstr(#s);
+
+gfx_r = 0.70; gfx_g = 0.95; gfx_b = 0.70;
+gfx_x = 12; gfx_y = 58;
+sprintf(#s, "F#2 %.2f    F#4 %.2f    F#6 %.2f Hz", ref_hz * pow(2, -27/12), ref_hz * pow(2, -3/12), ref_hz * pow(2, 21/12));
+gfx_drawstr(#s);
+
+gfx_r = 0.80; gfx_g = 0.84; gfx_b = 0.90;
+gfx_x = 12; gfx_y = 84;
+sprintf(#s, "window %.1f ms (%d smp)    tap wrap every %.2f s", wms, ws, wrap);
+gfx_drawstr(#s);
+
+gfx_x = 12; gfx_y = 106;
+sprintf(#s, "crossfade %.0f%% (%.2f s)    wet %.0f%%    trim %+.1f dB", xf_p * 200, wrap * xf_p * 2, wet_s * 100, slider7);
+gfx_drawstr(#s);
+
+// --- crossfade meters -------------------------------------------------------
+gfx_r = 0.22; gfx_g = 0.24; gfx_b = 0.29;
+gfx_rect(12, 136, 200, 10);
+gfx_rect(12, 152, 200, 10);
+gfx_r = 0.35; gfx_g = 0.75; gfx_b = 1.00;
+gfx_rect(12, 136, max(0, min(200, 200 * g1)), 10);
+gfx_r = 1.00; gfx_g = 0.55; gfx_b = 0.30;
+gfx_rect(12, 152, max(0, min(200, 200 * g2)), 10);
+gfx_r = 0.62; gfx_g = 0.64; gfx_b = 0.70;
+gfx_x = 222; gfx_y = 134;
+sprintf(#s, "tap A %.2f", g1);
+gfx_drawstr(#s);
+gfx_x = 222; gfx_y = 150;
+sprintf(#s, "tap B %.2f", g2);
+gfx_drawstr(#s);
+
+gfx_r = 0.45; gfx_g = 0.47; gfx_b = 0.52;
+gfx_x = 12; gfx_y = 176;
+sprintf(#s, "STRYK 144 pack - pitch only, no tempo sync (host %.1f BPM)", tempo);
+gfx_drawstr(#s);

@@ -1,0 +1,320 @@
+desc:STRYK ScaleForce - MIDI scale quantiser (F# minor / A=432 defaults)
+//tags: MIDI processing scale quantize key harmony trance
+//author: STRYK 144 pack
+
+/*
+   ScaleForce - forces every incoming NOTE ON/OFF into a chosen scale.
+
+   Session defaults baked in for STRYK's current sessions:
+     Root  = F#   (F# natural minor = Camelot 11A, his key)
+     Scale = Natural Minor (Aeolian): 0 2 3 5 7 8 10 semitones
+             -> F# G# A B C# D E
+     Snap  = Nearest (ties resolve DOWNWARD, i.e. the flat neighbour wins)
+     Block Program Change = YES (ships ON - PC events stomp VST preset
+             picks on every transport start, so they die here)
+
+   Tuning note (informational only - MIDI note numbers carry no Hz):
+     A = 432 Hz is 1200 * log2(432/440) = -31.77 cents vs A=440.
+     F# in A=432:  F#0 22.70  F#1 45.41  F#2 90.82  F#3 181.63
+                   F#4 363.27  F#5 726.54  F#6 1453.08  F#7 2906.16
+     freq(n) = Aref * 2^((n-69)/12);  F#4 = MIDI 66.
+     The "A Reference Hz" slider (default 432) drives the on-screen Hz
+     readout ONLY. It cannot and does not retune MIDI note numbers - use
+     the synth master tune or a pitch-bend detuner for that.
+
+   Tempo: this effect is entirely tempo-agnostic (no timing, no delays),
+   so it is correct at 144 BPM and at any other project tempo. Nothing
+   is hardcoded to 144. For reference at 144 BPM: 1/4 = 416.667 ms,
+   1/8 = 208.333, 1/16 = 104.167, one 4/4 bar = 1666.67 ms.
+
+   Hanging-note safety: every NOTE ON stores the note number it was
+   mapped to, per MIDI channel (16 x 128 slots). The matching NOTE OFF
+   reads that slot back, so changing Root/Scale/Direction while notes
+   are held can never strand a voice. Repeated ONs on the same input
+   note reference-count, so a retrigger plus one OFF cannot leak either.
+   Poly aftertouch follows its note. CC120/CC123 clear that channel map.
+*/
+
+in_pin:none
+out_pin:none
+
+// Root: index 0 = C ... 11 = B.  Default 6 = F#.
+slider1:6<0,11,1{C,C#,D,D#,E,F,F#,G,G#,A,A#,B}>Root Note
+slider2:0<0,6,1{Natural Minor (Aeolian),Harmonic Minor,Dorian,Phrygian,Major (Ionian),Minor Pentatonic,Phrygian Dominant}>Scale
+slider3:0<0,2,1{Nearest (ties go down),Down only,Up only}>Snap Direction
+slider4:0<0,16,1{All Channels,Ch 1,Ch 2,Ch 3,Ch 4,Ch 5,Ch 6,Ch 7,Ch 8,Ch 9,Ch 10,Ch 11,Ch 12,Ch 13,Ch 14,Ch 15,Ch 16}>MIDI Channel
+slider5:0<0,127,1>Bypass Below Note (MIDI note #, 0 = none)
+slider6:127<0,127,1>Bypass Above Note (MIDI note #, 127 = none)
+slider7:1<0,1,1{No - pass them through,Yes - block PC + Bank Select}>Block Program Change
+slider8:432<400,466,0.01>A Reference Hz (display readout only)
+
+@init
+
+ext_nodenorm = 1;   // no audio path here, but harmless and pack-consistent
+
+// ---- memory map -----------------------------------------------------
+rel_tbl = 0;      //   12 slots : 1 = this semitone-from-root is in scale
+sc_mask = 16;     //    7 slots : scale definitions as 12-bit masks
+map_out = 32;     // 2048 slots : (mapped output note + 1), 0 = not held
+map_cnt = 2080;   // 2048 slots : how many ONs are stacked on that input note
+freembuf(4128);
+
+memset(map_out, 0, 2048);
+memset(map_cnt, 0, 2048);
+
+// ---- scale definitions: bit i set = semitone i above root is in scale
+sc_mask[0] = 1453;  // Natural Minor     0 2 3 5 7 8 10
+sc_mask[1] = 2477;  // Harmonic Minor    0 2 3 5 7 8 11
+sc_mask[2] = 1709;  // Dorian            0 2 3 5 7 9 10
+sc_mask[3] = 1451;  // Phrygian          0 1 3 5 7 8 10
+sc_mask[4] = 2741;  // Major (Ionian)    0 2 4 5 7 9 11
+sc_mask[5] = 1193;  // Minor Pentatonic  0 3 5 7 10
+sc_mask[6] = 1459;  // Phrygian Dominant 0 1 4 5 7 8 10
+
+// sensible state before the first @slider pass
+root_pc = 6; sc_idx = 0; dir_mode = 0; ch_filt = 0;
+lo_note = 0; hi_note = 127; block_pc = 1; a_ref = 432;
+root_hz = 363.27; a_cents = -31.77;
+last_in = -1; last_out = -1;
+rel_tbl[0] = 1; rel_tbl[2] = 1; rel_tbl[3]  = 1; rel_tbl[5] = 1;
+rel_tbl[7] = 1; rel_tbl[8] = 1; rel_tbl[10] = 1;
+strcpy(#rname,  "F#");
+strcpy(#scname, "Natural Minor");
+
+// ---- helpers --------------------------------------------------------
+
+// is absolute MIDI note n a member of the current scale?
+function in_scale(n) local(rel) (
+  rel = n - root_pc;
+  rel = rel - floor(rel / 12) * 12;   // EEL2 has no fmod
+  rel_tbl[rel];
+);
+
+// snap n into the scale honouring dir_mode; always returns 0..127
+function quantize(n) local(d, c) (
+  n < 0   ? ( n = 0; );
+  n > 127 ? ( n = 127; );
+  c = -1;
+
+  // Down only
+  dir_mode == 1 ? (
+    d = 0;
+    while (d <= 24 && c < 0) (
+      (n - d >= 0 && in_scale(n - d)) ? ( c = n - d; );
+      d += 1;
+    );
+  );
+
+  // Up only
+  (c < 0 && dir_mode == 2) ? (
+    d = 0;
+    while (d <= 24 && c < 0) (
+      (n + d <= 127 && in_scale(n + d)) ? ( c = n + d; );
+      d += 1;
+    );
+  );
+
+  // Nearest - also the fallback if a directional search ran off the end
+  c < 0 ? (
+    d = 0;
+    while (d <= 24 && c < 0) (
+      (n - d >= 0 && in_scale(n - d)) ? ( c = n - d; );           // ties go down
+      (c < 0 && n + d <= 127 && in_scale(n + d)) ? ( c = n + d; );
+      d += 1;
+    );
+  );
+
+  (c < 0 || c > 127) ? ( c = n; );   // paranoia: never emit garbage
+  c;
+);
+
+// forget every held-note mapping on one channel
+function clear_chan_map(cc) local(b) (
+  b = cc * 128;
+  memset(map_out + b, 0, 128);
+  memset(map_cnt + b, 0, 128);
+);
+
+@slider
+
+root_pc  = slider1 | 0;
+sc_idx   = slider2 | 0;
+dir_mode = slider3 | 0;
+ch_filt  = slider4 | 0;
+lo_note  = slider5 | 0;
+hi_note  = slider6 | 0;
+block_pc = slider7 | 0;
+a_ref    = max(1, slider8);
+
+root_pc < 0  ? ( root_pc = 0;  );
+root_pc > 11 ? ( root_pc = 11; );
+sc_idx  < 0  ? ( sc_idx  = 0;  );
+sc_idx  > 6  ? ( sc_idx  = 6;  );
+
+// tolerate the range sliders being dragged past each other
+lo_note > hi_note ? ( s_tmp = lo_note; lo_note = hi_note; hi_note = s_tmp; );
+
+// unpack the scale mask into the 12-slot membership table
+s_m   = sc_mask[sc_idx];
+s_bit = 1;
+s_i   = 0;
+loop(12,
+  rel_tbl[s_i] = (s_m & s_bit) > 0 ? 1 : 0;
+  s_bit = s_bit * 2;
+  s_i += 1;
+);
+rel_tbl[0] = 1;   // root is always in - guarantees quantize() terminates
+
+// ---- display strings + Hz readout ----
+strcpy(#rname, "C");
+root_pc ==  1 ? ( strcpy(#rname, "C#"); );
+root_pc ==  2 ? ( strcpy(#rname, "D");  );
+root_pc ==  3 ? ( strcpy(#rname, "D#"); );
+root_pc ==  4 ? ( strcpy(#rname, "E");  );
+root_pc ==  5 ? ( strcpy(#rname, "F");  );
+root_pc ==  6 ? ( strcpy(#rname, "F#"); );
+root_pc ==  7 ? ( strcpy(#rname, "G");  );
+root_pc ==  8 ? ( strcpy(#rname, "G#"); );
+root_pc ==  9 ? ( strcpy(#rname, "A");  );
+root_pc == 10 ? ( strcpy(#rname, "A#"); );
+root_pc == 11 ? ( strcpy(#rname, "B");  );
+
+strcpy(#scname, "Natural Minor");
+sc_idx == 1 ? ( strcpy(#scname, "Harmonic Minor");    );
+sc_idx == 2 ? ( strcpy(#scname, "Dorian");            );
+sc_idx == 3 ? ( strcpy(#scname, "Phrygian");          );
+sc_idx == 4 ? ( strcpy(#scname, "Major");             );
+sc_idx == 5 ? ( strcpy(#scname, "Minor Pentatonic");  );
+sc_idx == 6 ? ( strcpy(#scname, "Phrygian Dominant"); );
+
+root_hz = a_ref * pow(2, ((root_pc + 60) - 69) / 12);   // root in octave 4
+a_cents = 1200 * log(a_ref / 440) / log(2);
+
+@block
+
+while (midirecv(mo, msg1, msg2, msg3)) (
+
+  st      = msg1 & $xF0;
+  mch     = msg1 & $x0F;
+  base    = mch * 128;
+  pass    = 1;
+  chan_ok = (ch_filt == 0) || (mch == ch_filt - 1);
+
+  // ---- kill Program Change and Bank Select (CC0 / CC32) -------------
+  (block_pc && st == $xC0) ? ( pass = 0; );
+  (block_pc && st == $xB0 && (msg2 == 0 || msg2 == 32)) ? ( pass = 0; );
+
+  // ---- NOTE ON (status 0x90, velocity > 0) --------------------------
+  (pass && st == $x90 && msg3 > 0) ? (
+    nin = msg2 & $x7F;
+    map_cnt[base + nin] > 0 ? (
+      // already sounding: reuse the SAME target so the OFF still matches
+      nout = map_out[base + nin] - 1;
+      nout < 0 ? ( nout = nin; );
+      map_cnt[base + nin] += 1;
+    ) : (
+      (chan_ok && nin >= lo_note && nin <= hi_note) ?
+        ( nout = quantize(nin); ) : ( nout = nin; );
+      map_out[base + nin] = nout + 1;
+      map_cnt[base + nin] = 1;
+    );
+    last_in = nin; last_out = nout;
+    msg2 = nout;
+  );
+
+  // ---- NOTE OFF (status 0x80, or 0x90 with velocity 0) --------------
+  (pass && (st == $x80 || (st == $x90 && msg3 == 0))) ? (
+    nin = msg2 & $x7F;
+    map_cnt[base + nin] > 0 ? (
+      nout = map_out[base + nin] - 1;
+      nout < 0 ? ( nout = nin; );
+      map_cnt[base + nin] -= 1;
+      map_cnt[base + nin] <= 0 ? (
+        map_cnt[base + nin] = 0;
+        map_out[base + nin] = 0;
+      );
+    ) : (
+      // orphan OFF (no matching ON seen): best effort with current settings
+      (chan_ok && nin >= lo_note && nin <= hi_note) ?
+        ( nout = quantize(nin); ) : ( nout = nin; );
+    );
+    msg2 = nout;
+  );
+
+  // ---- POLY AFTERTOUCH follows the note it addresses -----------------
+  (pass && st == $xA0) ? (
+    nin = msg2 & $x7F;
+    map_cnt[base + nin] > 0 ? (
+      nout = map_out[base + nin] - 1;
+      nout >= 0 ? ( msg2 = nout; );
+    ) : (
+      (chan_ok && nin >= lo_note && nin <= hi_note) ? ( msg2 = quantize(nin); );
+    );
+  );
+
+  // ---- All Sound Off / All Notes Off: drop this channel mappings -----
+  (st == $xB0 && (msg2 == 120 || msg2 == 123)) ? ( clear_chan_map(mch); );
+
+  // everything else (CC, pitch bend, channel AT, clock) untouched
+  pass ? ( midisend(mo, msg1, msg2, msg3); );
+);
+
+@gfx 460 152
+
+gfx_setfont(1, "Arial", 16);
+gfx_setfont(2, "Arial", 12);
+
+gfx_r = 0.07; gfx_g = 0.08; gfx_b = 0.10; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+gfx_setfont(1);
+gfx_r = 0.90; gfx_g = 0.93; gfx_b = 1.00;
+gfx_x = 10; gfx_y = 9;
+gfx_drawstr(#rname);
+gfx_drawstr("  ");
+gfx_drawstr(#scname);
+
+gfx_setfont(2);
+gfx_r = 0.55; gfx_g = 0.61; gfx_b = 0.72;
+gfx_x = 10; gfx_y = 33;
+sprintf(#info, "A=%.2f Hz (%.2f cents vs 440)   root oct4 = %.2f Hz",
+        a_ref, a_cents, root_hz);
+gfx_drawstr(#info);
+
+g_cw = (gfx_w - 20) / 12;
+g_y  = 56;
+g_h  = 40;
+
+g_i = 0;
+loop(12,
+  g_x = 10 + g_i * g_cw;
+  rel_tbl[g_i] ? (
+    g_i == 0 ? ( gfx_r = 0.25; gfx_g = 0.80; gfx_b = 0.95; )
+             : ( gfx_r = 0.13; gfx_g = 0.42; gfx_b = 0.56; );
+  ) : (
+    gfx_r = 0.15; gfx_g = 0.16; gfx_b = 0.19;
+  );
+  gfx_rect(g_x + 1, g_y, max(1, g_cw - 2), g_h);
+  g_i += 1;
+);
+
+gfx_setfont(2);
+g_i = 0;
+loop(12,
+  g_x = 10 + g_i * g_cw;
+  rel_tbl[g_i] ? ( gfx_r = 0.92; gfx_g = 0.95; gfx_b = 1.00; )
+               : ( gfx_r = 0.33; gfx_g = 0.34; gfx_b = 0.38; );
+  gfx_x = g_x + g_cw * 0.5 - 4;
+  gfx_y = g_y + g_h + 5;
+  gfx_drawnumber(g_i, 0);
+  g_i += 1;
+);
+
+gfx_r = 0.48; gfx_g = 0.53; gfx_b = 0.63;
+gfx_x = 10; gfx_y = gfx_h - 18;
+last_in >= 0 ? (
+  sprintf(#last, "last note in %d  ->  out %d", last_in, last_out);
+) : (
+  strcpy(#last, "semitones above root - lit = in scale");
+);
+gfx_drawstr(#last);

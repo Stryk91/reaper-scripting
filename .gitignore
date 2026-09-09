@@ -5,5 +5,10 @@
 peaks/
 __pycache__/
 
+# Runtime logs. strip_log.txt carried real project and track names from the
+# user's sessions - runtime output has no business in a public repo.
+*_log.txt
+strip_log.txt
+
 # worktrees live here, not tracked
 .claude/

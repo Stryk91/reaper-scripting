@@ -1,0 +1,19 @@
+# REAPER content is compared byte-for-byte against the live install by
+# install.ps1 (Get-FileHash both sides, skip if equal). If git rewrites line
+# endings on checkout, every file hashes differently from the installed copy
+# and the installer reports the whole tree as changed on every run, forever.
+# Pin these to LF, which is what is on disk and what got installed.
+#
+# REAPER itself reads either ending, so this is about keeping the hashes
+# stable, not about REAPER's parser.
+
+*               text=auto
+
+*.lua           text eol=lf
+*.py            text eol=lf
+*.RfxChain      text eol=lf
+jsfx/**         text eol=lf
+
+# PowerShell stays CRLF: it is Windows-only tooling and some older hosts are
+# unhappy with LF-only scripts.
+*.ps1           text eol=crlf

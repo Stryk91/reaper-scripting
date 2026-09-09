@@ -1,0 +1,24 @@
+SHOW 0
+LASTSEL 0
+DOCKED 0
+BYPASS 0 0 0
+<JS stryk/stryk_monobass ""
+120 1 0 0 24 0 0 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {AC6EA634-82DC-4A62-8495-997556F6C5AA}
+WAK 0 0
+BYPASS 0 0 0
+<JS stryk/stryk_transient ""
+18 -15 1 40 -1.5 0 100 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {24AF226B-C2FE-40BB-B954-AA79985DCB8E}
+WAK 0 0
+BYPASS 0 0 0
+<JS stryk/stryk_pump ""
+2 70 0.35 1 0 0 100 144 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+>
+FLOATPOS 0 0 0 0
+FXID {478CE59B-9905-4CBB-9B42-BF2A37F8F8E9}
+WAK 0 0

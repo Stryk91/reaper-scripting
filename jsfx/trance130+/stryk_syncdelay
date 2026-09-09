@@ -1,0 +1,323 @@
+desc:STRYK Sync Delay -- tempo-synced stereo ping-pong delay
+//tags: delay echo stereo ping-pong tempo-sync trance
+//author: STRYK 144 pack
+
+/* -----------------------------------------------------------------------
+   stryk_syncdelay
+   Built for the current session: 144 BPM / F# / A=432 Hz.
+
+   WHAT IT DOES
+     Two independent tempo-synced delay lines (one per side) with an
+     optional ping-pong cross-feed, a filtered feedback path and dry-signal
+     ducking so the repeats never crowd the lead.
+
+   DEFAULTS AND WHY
+     Left  = dotted 1/8 -> 312.500 ms at 144 BPM
+     Right = 1/8        -> 208.333 ms at 144 BPM
+       That 3:2 pair is the classic uplifting-trance pluck roll: the dotted
+       side lands off the grid, the straight side re-anchors it, and the
+       two never stack on the same 1/16 so the 4-on-the-floor stays clean.
+     Feedback 38%      - three or four audible repeats, tail gone by the bar.
+     Ping-Pong On      - the two lines feed each other, so the bounce widens
+                         without any static L/R phase trick.
+     Feedback Low-Cut 180 Hz - sits right on F#3 (181.63 Hz at A=432), so
+                         the repeats start above the bass fundamental and
+                         the sub/kick region stays untouched by the tail.
+     Feedback High-Cut 7000 Hz - each pass darkens, the tail recedes.
+     Wet 28% / Dry 100% - insert-and-forget balance, good the moment it
+                         lands on a lead or pluck bus.
+     Ducking 25%       - up to 18 dB of wet pull-down at 100%; at 25% the
+                         wet drops about 4.5 dB while the source is loud and
+                         springs back in the gaps.
+
+   TEMPO
+     Delay times are derived from the HOST tempo every block
+     (seconds = beats * 60 / tempo), so the plugin follows the project and
+     any tempo map. 144 appears only in slider labels and as the fallback
+     if the host reports a nonsense tempo.
+
+   TIME CHANGES
+     Switching a division or riding a tempo map does NOT pitch-bend: the
+     old and new read pointers are equal-power crossfaded over 30 ms.
+
+   144 BPM REFERENCE (ms)
+     1/2 833.333 | 1/4 416.667 | 1/8d 312.500 | 1/4t 277.778
+     1/8 208.333 | 1/16d 156.250 | 1/8t 138.889 | 1/16 104.167
+   ----------------------------------------------------------------------- */
+
+slider1:1<0,7,1{1/4 (416.7 ms at 144),1/8 dotted (312.5 ms at 144),1/8 (208.3 ms at 144),1/16 dotted (156.3 ms at 144),1/16 (104.2 ms at 144),1/8 triplet (138.9 ms at 144),1/4 triplet (277.8 ms at 144),1/2 (833.3 ms at 144)}>Left Division
+slider2:2<0,7,1{1/4 (416.7 ms at 144),1/8 dotted (312.5 ms at 144),1/8 (208.3 ms at 144),1/16 dotted (156.3 ms at 144),1/16 (104.2 ms at 144),1/8 triplet (138.9 ms at 144),1/4 triplet (277.8 ms at 144),1/2 (833.3 ms at 144)}>Right Division
+slider3:38<0,95,0.1>Feedback (%)
+slider4:1<0,1,1{Off,On}>Ping-Pong
+slider5:7000<500,20000,10>Feedback High-Cut (Hz)
+slider6:180<20,2000,1>Feedback Low-Cut (Hz)
+slider7:28<0,100,0.1>Wet (%)
+slider8:100<0,100,0.1>Dry (%)
+slider9:25<0,100,0.1>Ducking (%)
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+@init
+
+ext_nodenorm = 1;
+
+// ---- linear-interpolated read from a delay line -------------------------
+function dread(base, pos) local(i0, i1, fr) (
+  pos < 0 ? pos += dlN;
+  pos >= dlN ? pos -= dlN;
+  i0 = pos|0;
+  fr = pos - i0;
+  i1 = i0 + 1;
+  i1 >= dlN ? i1 -= dlN;
+  base[i0] + (base[i1] - base[i0]) * fr;
+);
+
+// ---- one-pole coefficient from a cutoff in Hz ---------------------------
+function pole(fc) (
+  fc = max(1, min(fc, srate * 0.45));
+  1 - exp(-2 * $pi * fc / srate);
+);
+
+// ---- NaN scrub ----------------------------------------------------------
+// NOTE: do NOT use (x != x) here. EEL2 implements == and != as an EPSILON
+// compare (fabs(a-b) vs 0.00001), and fabs(NaN-NaN) is NaN, so BOTH == and
+// != return 0 for a NaN -- the usual C idiom silently does nothing.
+// < > <= >= are exact in EEL2 and all return false for NaN, so testing
+// (x < 0 || x >= 0) is the reliable "is this a real number" check.
+// Infinities pass through here and are caught by the +/-4 clamp below.
+function denan(x) (
+  (x < 0 || x >= 0) ? x : 0;
+);
+
+// ---- note division -> length in quarter-note beats ----------------------
+divtab = 0;
+divtab[0] = 1.0;      // 1/4
+divtab[1] = 0.75;     // 1/8 dotted
+divtab[2] = 0.5;      // 1/8
+divtab[3] = 0.375;    // 1/16 dotted
+divtab[4] = 0.25;     // 1/16
+divtab[5] = 1/3;      // 1/8 triplet
+divtab[6] = 2/3;      // 1/4 triplet
+divtab[7] = 2.0;      // 1/2
+
+// ---- buffers (6.5 s per side covers a 1/2 note down to 20 BPM) ----------
+MAXDELSEC = 6.5;
+dlN = (srate * MAXDELSEC)|0;
+dlN < 1024 ? dlN = 1024;
+bufL = 16;
+bufR = bufL + dlN;
+memset(bufL, 0, dlN * 2);
+freembuf(bufR + dlN + 16);
+
+wpos = 0;
+
+// ---- state --------------------------------------------------------------
+lpL = 0; lpR = 0; hpL = 0; hpR = 0;
+env = 0; duckg = 1;
+sm_wet = 0; sm_dry = 0; sm_fb = 0;
+curL = 0; curR = 0;
+fromL = 0; toL = 0; posL = 0; xfL = 0;
+fromR = 0; toR = 0; posR = 0; xfR = 0;
+initdone = 0;
+primed = 0;
+
+cur_tempo = tempo > 0 ? tempo : 144;
+
+xf_len = max(64, srate * 0.030);
+xf_inc = 1 / xf_len;
+
+env_att = 1 - exp(-1 / (0.005 * srate));   // 5 ms attack
+env_rel = 1 - exp(-1 / (0.180 * srate));   // 180 ms release
+sm_c    = 1 - exp(-1 / (0.020 * srate));   // 20 ms control smoothing
+
+DB2LN = 0.11512925464970229;               // ln(10)/20
+
+ext_tail_size = srate * 8;
+
+@slider
+
+c_lp = pole(slider5);                      // feedback high-cut
+c_hp = pole(slider6);                      // feedback low-cut
+fb_t     = max(0, min(95,  slider3)) * 0.01;
+wet_t    = max(0, min(100, slider7)) * 0.01;
+dry_t    = max(0, min(100, slider8)) * 0.01;
+duck_amt = max(0, min(100, slider9)) * 0.01;
+divL_beats = divtab[max(0, min(7, slider1|0))];
+divR_beats = divtab[max(0, min(7, slider2|0))];
+pingpong = slider4 >= 0.5;
+
+// First run after load / samplerate change: snap the smoothers straight to
+// their targets. Ramping them up from zero fades the DRY signal in over
+// ~92 ms on every init, which eats the front of an offline render.
+primed < 0.5 ? (
+  sm_wet = wet_t; sm_dry = dry_t; sm_fb = fb_t; duckg = 1; primed = 1;
+);
+
+@block
+
+tmpo = tempo;
+tmpo < 20  ? tmpo = 144;                   // host reported nonsense
+tmpo > 960 ? tmpo = 960;
+cur_tempo = tmpo;
+
+spb = 60 / tmpo;                           // seconds per quarter note
+tgtL = divL_beats * spb * srate;
+tgtR = divR_beats * spb * srate;
+tgtL = max(2, min(tgtL, dlN - 4));
+tgtR = max(2, min(tgtR, dlN - 4));
+
+initdone < 0.5 ? (
+  curL = tgtL; curR = tgtR; initdone = 1;
+) : (
+  (xfL < 0.5 && abs(tgtL - curL) > 0.5) ? (
+    fromL = curL; toL = tgtL; posL = 0; xfL = 1;
+  );
+  (xfR < 0.5 && abs(tgtR - curR) > 0.5) ? (
+    fromR = curR; toR = tgtR; posR = 0; xfR = 1;
+  );
+);
+
+@sample
+
+inL = spl0;
+inR = num_ch >= 2 ? spl1 : spl0;
+
+// ---- smoothed controls (no zipper on anything touching gain) ------------
+sm_wet += sm_c * (wet_t - sm_wet);
+sm_dry += sm_c * (dry_t - sm_dry);
+sm_fb  += sm_c * (fb_t  - sm_fb);
+
+// ---- ducking: an envelope of the DRY input pulls the wet down -----------
+mag = max(abs(inL), abs(inR));
+mag > env ? env += env_att * (mag - env) : env += env_rel * (mag - env);
+drv = min(1, env * 2.5);
+dgain = exp(-DB2LN * duck_amt * 18 * drv);
+duckg += sm_c * (dgain - duckg);
+
+// ---- read the two lines (equal-power crossfade while retiming) ----------
+xfL > 0.5 ? (
+  gA = sqrt(1 - posL); gB = sqrt(posL);
+  dL = dread(bufL, wpos - fromL) * gA + dread(bufL, wpos - toL) * gB;
+  posL += xf_inc;
+  posL >= 1 ? ( xfL = 0; curL = toL; );
+) : (
+  dL = dread(bufL, wpos - curL);
+);
+
+xfR > 0.5 ? (
+  gA = sqrt(1 - posR); gB = sqrt(posR);
+  dR = dread(bufR, wpos - fromR) * gA + dread(bufR, wpos - toR) * gB;
+  posR += xf_inc;
+  posR >= 1 ? ( xfR = 0; curR = toR; );
+) : (
+  dR = dread(bufR, wpos - curR);
+);
+
+dL = denan(dL);
+dR = denan(dR);
+
+// ---- feedback path: one-pole low-pass then one-pole high-pass -----------
+lpL += c_lp * (dL - lpL);
+hpL += c_hp * (lpL - hpL);
+fsL = lpL - hpL;
+
+lpR += c_lp * (dR - lpR);
+hpR += c_hp * (lpR - hpR);
+fsR = lpR - hpR;
+
+lpL = denan(lpL); hpL = denan(hpL);
+lpR = denan(lpR); hpR = denan(hpR);
+
+// ---- write into the lines (ping-pong crosses the feedback) --------------
+pingpong ? (
+  wrL = inL + sm_fb * fsR;
+  wrR = inR + sm_fb * fsL;
+) : (
+  wrL = inL + sm_fb * fsL;
+  wrR = inR + sm_fb * fsR;
+);
+
+wrL = denan(wrL); wrR = denan(wrR);
+abs(wrL) > 4 ? wrL = 4 * sign(wrL);        // runaway safety net
+abs(wrR) > 4 ? wrR = 4 * sign(wrR);
+
+bufL[wpos] = wrL;
+bufR[wpos] = wrR;
+wpos += 1;
+wpos >= dlN ? wpos = 0;
+
+// ---- mix ----------------------------------------------------------------
+wg = sm_wet * duckg;
+num_ch >= 2 ? (
+  spl0 = inL * sm_dry + dL * wg;
+  spl1 = inR * sm_dry + dR * wg;
+) : (
+  spl0 = inL * sm_dry + (dL + dR) * 0.5 * wg;
+);
+
+@gfx 470 150
+
+gfx_r = 0.07; gfx_g = 0.08; gfx_b = 0.11; gfx_a = 1;
+gfx_rect(0, 0, gfx_w, gfx_h);
+
+gfx_setfont(1, "Arial", 16);
+gfx_r = 0.98; gfx_g = 0.78; gfx_b = 0.28; gfx_a = 1;
+gfx_x = 12; gfx_y = 10;
+sprintf(#hdr, "SYNC DELAY    %.2f BPM", cur_tempo);
+gfx_drawstr(#hdr);
+
+gmsL = curL * 1000 / max(1, srate);
+gmsR = curR * 1000 / max(1, srate);
+gspan = max(gmsL, gmsR) * 8;
+gspan < 1 ? gspan = 1;
+gbx = 108;
+gbw = gfx_w - gbx - 14;
+gbw < 20 ? gbw = 20;
+
+gfx_setfont(2, "Arial", 13);
+
+// left row: repeat ticks, brightness follows the feedback decay
+gfx_r = 0.45; gfx_g = 0.82; gfx_b = 1.0; gfx_a = 1;
+gfx_x = 12; gfx_y = 46;
+sprintf(#lrow, "L  %.1f ms", gmsL);
+gfx_drawstr(#lrow);
+gfx_a = 0.20; gfx_rect(gbx, 52, gbw, 1);
+gn = 1;
+loop(16,
+  gpx = gbx + gbw * (gmsL * gn) / gspan;
+  gpx < gbx + gbw ? (
+    gfx_a = 0.18 + 0.82 * pow(fb_t, gn - 1);
+    gfx_rect(gpx, 43, 2, 16);
+  );
+  gn += 1;
+);
+
+// right row
+gfx_r = 1.0; gfx_g = 0.55; gfx_b = 0.72; gfx_a = 1;
+gfx_x = 12; gfx_y = 84;
+sprintf(#rrow, "R  %.1f ms", gmsR);
+gfx_drawstr(#rrow);
+gfx_a = 0.20; gfx_rect(gbx, 90, gbw, 1);
+gn = 1;
+loop(16,
+  gpx = gbx + gbw * (gmsR * gn) / gspan;
+  gpx < gbx + gbw ? (
+    gfx_a = 0.18 + 0.82 * pow(fb_t, gn - 1);
+    gfx_rect(gpx, 81, 2, 16);
+  );
+  gn += 1;
+);
+
+gfx_a = 1; gfx_r = 0.72; gfx_g = 0.72; gfx_b = 0.76;
+gfx_x = 12; gfx_y = 122;
+sprintf(#inf, "FB %.0f%%   Wet %.0f%%   Dry %.0f%%   Duck %.0f%%", slider3, slider7, slider8, slider9);
+gfx_drawstr(#inf);
+pingpong ? (
+  gfx_r = 0.98; gfx_g = 0.78; gfx_b = 0.28;
+  gfx_drawstr("   PING-PONG");
+) : (
+  gfx_drawstr("   PARALLEL");
+);
