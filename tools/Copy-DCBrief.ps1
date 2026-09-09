@@ -7,7 +7,7 @@
   open a path. The only thing that always works is pasted text. This loads the brief
   straight onto the clipboard.
 
-  -WithScript appends the full current source of build_rs5k_from_slices.lua, for when
+  -WithScript appends the full current source of stryk_build_rs5k_from_slices.lua, for when
   DC needs to review the code rather than just the findings.
 
 .EXAMPLE
@@ -19,14 +19,14 @@ param([switch]$WithScript)
 
 $root   = Split-Path $PSScriptRoot -Parent
 $brief  = Join-Path $root 'docs\DC-BRIEF.md'
-$script = Join-Path $root 'scripts\build_rs5k_from_slices.lua'
+$script = Join-Path $root 'scripts\stryk_build_rs5k_from_slices.lua'
 
 if (-not (Test-Path $brief)) { throw "Brief not found: $brief" }
 $text = Get-Content $brief -Raw
 
 if ($WithScript) {
   if (-not (Test-Path $script)) { throw "Script not found: $script" }
-  $text += "`n`n---`n`n## Current source: scripts/build_rs5k_from_slices.lua`n`n" +
+  $text += "`n`n---`n`n## Current source: scripts/stryk_build_rs5k_from_slices.lua`n`n" +
            '```lua' + "`n" + (Get-Content $script -Raw).TrimEnd() + "`n" + '```' + "`n"
 }
 

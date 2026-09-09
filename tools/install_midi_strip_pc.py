@@ -4,12 +4,15 @@ r"""install.py -- install the always-on MIDI program-change stripper into REAPER
 Copies two ReaScripts into REAPER's Scripts folder and wires the startup hook so the
 stripper runs from every REAPER launch with no clicks:
 
-    <resource>\Scripts\midi_strip_pc.lua          the worker (defer loop)
-    <resource>\Scripts\midi_strip_pc_toggle.lua   on/off switch, bindable as an action
+    <resource>\Scripts\stryk_midi_strip_pc.lua        the worker (defer loop)
+    <resource>\Scripts\stryk_midi_strip_pc_toggle.lua on/off switch, bindable as an action
     <resource>\Scripts\__startup.lua              REAPER runs this natively at launch
 
-Safe to re-run. If __startup.lua already exists it is backed up and the loader line is
-APPENDED, never replacing what is already there.
+Safe to re-run. __startup.lua is always backed up first. Its loader line is APPENDED if
+absent; the one exception is a loader still pointing at the pre-2026-09-10 name
+(midi_strip_pc.lua), which is rewritten in place -- that file no longer ships, so leaving
+the stale dofile would make REAPER throw on every launch. Nothing else in the file is
+touched either way.
 
     python install.py              install / update
     python install.py --uninstall  remove the scripts and the loader line
@@ -29,10 +32,17 @@ HERE = Path(__file__).parent          # reaper-scripting/tools
 SRC = HERE.parent / "scripts"         # reaper-scripting/scripts
 RES = Path(os.environ["APPDATA"]) / "REAPER"
 SCRIPTS = RES / "Scripts"
-WORKER = "midi_strip_pc.lua"
-TOGGLE = "midi_strip_pc_toggle.lua"
+WORKER = "stryk_midi_strip_pc.lua"
+TOGGLE = "stryk_midi_strip_pc_toggle.lua"
+
+# Pre-2026-09-10 names, before the stryk_ prefix. Kept so an existing install
+# can be migrated and cleaned up rather than left with a dofile pointing at a
+# file this script is about to stop shipping.
+OLD_WORKER = "midi_strip_pc.lua"
+OLD_TOGGLE = "midi_strip_pc_toggle.lua"
 STARTUP = "__startup.lua"
-LOADER = 'dofile(reaper.GetResourcePath() .. "/Scripts/midi_strip_pc.lua")'
+LOADER = 'dofile(reaper.GetResourcePath() .. "/Scripts/stryk_midi_strip_pc.lua")'
+# Substring of the new worker name too, so it matches old AND new wiring.
 MARK = "midi_strip_pc.lua"
 
 
@@ -73,14 +83,33 @@ def install():
         shutil.copy2(SRC / name, SCRIPTS / name)
         print(f"  installed  {SCRIPTS / name}")
 
+    # Retire the pre-prefix copies. Leaving them behind means REAPER's action
+    # list shows both, and the stale one still runs its own defer loop if it
+    # was ever registered - two strippers sweeping the same project.
+    for old in (OLD_WORKER, OLD_TOGGLE):
+        p = SCRIPTS / old
+        if p.exists():
+            p.unlink()
+            print(f"  retired    {p}  (renamed to stryk_ prefix)")
+
     sp = SCRIPTS / STARTUP
     if not sp.exists():
         shutil.copy2(SRC / STARTUP, sp)
         print(f"  created    {sp}")
     else:
         txt = sp.read_text(encoding="utf-8", errors="replace")
-        if MARK in txt:
+        lines = txt.splitlines()
+        if LOADER in txt:
             print(f"  already wired  {sp}")
+        elif any(MARK in l for l in lines):
+            # Wired to the OLD filename. Rewrite that line rather than
+            # appending: the old file has just been deleted, so leaving the
+            # stale dofile there makes REAPER throw on every single launch.
+            bak = sp.with_suffix(f".lua.bak-{time.strftime('%Y%m%d_%H%M%S')}")
+            shutil.copy2(sp, bak)
+            fixed = [LOADER if (MARK in l and "dofile" in l) else l for l in lines]
+            sp.write_text("\n".join(fixed) + "\n", encoding="utf-8")
+            print(f"  re-wired   {sp} to {WORKER}  (backup: {bak.name})")
         else:
             bak = sp.with_suffix(f".lua.bak-{time.strftime('%Y%m%d_%H%M%S')}")
             shutil.copy2(sp, bak)

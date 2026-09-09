@@ -41,7 +41,7 @@ $counts = @{ install = 0; same = 0; backup = 0 }
 function Install-Tree {
   # $Include: JSFX have no extension so they cannot be filtered by one, but
   # scripts\ must be limited to *.lua or build artefacts like
-  # build_rs5k_from_slices.lua.check.txt get installed into REAPER as well.
+  # stryk_build_rs5k_from_slices.lua.check.txt get installed into REAPER too.
   param([string]$Src, [string]$Dest, [string]$Label, [string]$Include)
 
   if (-not (Test-Path $Src)) { return }

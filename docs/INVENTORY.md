@@ -12,7 +12,7 @@ config under `G:\tmp`. 1075 stock/vendor files were ignored.
 |---|---|---|
 | fxchain | 16 | 8 |
 | jsfx | 57 | 14 |
-| reascript | 19 | 7 |
+| reascript | 19 | 9 |
 
 ## Canonical location per asset
 
@@ -29,16 +29,18 @@ config under `G:\tmp`. 1075 stock/vendor files were ignored.
 | `144 pluck f-sharp.rfxchain` | fxchain | `G:\pipelines\reaper-scripting\fxchains\trance130+\144 Pluck F-sharp.RfxChain` | 2 | 1 |
 | `144 riser fx.rfxchain` | fxchain | `G:\pipelines\reaper-scripting\fxchains\trance130+\144 Riser FX.RfxChain` | 2 | 1 |
 | `432 retune.rfxchain` | fxchain | `G:\pipelines\reaper-scripting\fxchains\trance130+\432 Retune.RfxChain` | 2 | 1 |
-| `__startup.lua` | reascript | `G:\pipelines\reaper-scripting\scripts\__startup.lua` | 4 | 2 **diverged** |
-| `build_rs5k_from_slices.lua` | reascript | `G:\pipelines\reaper-scripting\scripts\build_rs5k_from_slices.lua` | 2 | 1 |
-| `build_rs5k_from_slices.original-broken.lua` | reascript | `G:\pipelines\reaper-scripting\docs\build_rs5k_from_slices.ORIGINAL-broken.lua` | 1 | 1 |
-| `build_session.lua` | reascript | `G:\pipelines\reaper-scripting\projects\beneath-redemption\build_session.lua` | 1 | 1 |
+| `__startup.lua` | reascript | `G:\pipelines\reaper-scripting\scripts\__startup.lua` | 4 | 3 **diverged** |
 | `check_reascript.lua` | reascript | `G:\pipelines\reaper-scripting\tools\check_reascript.lua` | 1 | 1 |
-| `midi_strip_pc.lua` | reascript | `G:\pipelines\reaper-scripting\scripts\midi_strip_pc.lua` | 5 | 3 **diverged** |
-| `midi_strip_pc_toggle.lua` | reascript | `G:\pipelines\reaper-scripting\scripts\midi_strip_pc_toggle.lua` | 5 | 1 |
+| `midi_strip_pc.lua` | reascript | `(no pipelines copy)` | 3 | 1 |
+| `midi_strip_pc_toggle.lua` | reascript | `(no pipelines copy)` | 3 | 1 |
+| `stryk_build_rs5k_from_slices.lua` | reascript | `G:\pipelines\reaper-scripting\scripts\stryk_build_rs5k_from_slices.lua` | 2 | 1 |
+| `stryk_build_rs5k_from_slices.original-broken.lua` | reascript | `G:\pipelines\reaper-scripting\docs\stryk_build_rs5k_from_slices.ORIGINAL-broken.lua` | 1 | 1 |
+| `stryk_build_session.lua` | reascript | `G:\pipelines\reaper-scripting\projects\beneath-redemption\stryk_build_session.lua` | 1 | 1 |
 | `stryk_chordgen` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_chordgen` | 5 | 3 **diverged** |
 | `stryk_fs432_resonator` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_fs432_resonator` | 4 | 2 **diverged** |
 | `stryk_lfotool` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_lfotool` | 6 | 1 |
+| `stryk_midi_strip_pc.lua` | reascript | `G:\pipelines\reaper-scripting\scripts\stryk_midi_strip_pc.lua` | 2 | 1 |
+| `stryk_midi_strip_pc_toggle.lua` | reascript | `G:\pipelines\reaper-scripting\scripts\stryk_midi_strip_pc_toggle.lua` | 2 | 1 |
 | `stryk_monobass` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_monobass` | 3 | 1 |
 | `stryk_pump` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_pump` | 4 | 1 |
 | `stryk_retune432` | jsfx | `G:\pipelines\reaper-scripting\jsfx\trance130+\stryk_retune432` | 4 | 2 **diverged** |

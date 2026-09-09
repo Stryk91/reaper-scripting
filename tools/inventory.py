@@ -48,7 +48,11 @@ CHAIN_EXT = {".rfxchain"}
 # under G:\tmp. Stock content is vendor code and not ours to reorganise.
 OURS_PREFIXES = ("stryk", "144 ", "432 ")
 
-# Custom scripts that predate the convention, matched by exact name.
+# Pre-2026-09-10 names, from before the stryk_ prefix was applied to scripts.
+# Kept so stale copies under G:\tmp, and a REAPER that has not been reinstalled
+# yet, are still recognised as ours rather than counted as vendor files.
+# __startup.lua keeps its bare name permanently: REAPER only auto-runs a file
+# called exactly that.
 OURS_NAMES = {
     "build_rs5k_from_slices.lua",
     "build_rs5k_from_slices.original-broken.lua",
