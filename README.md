@@ -15,7 +15,20 @@ copies into REAPER.
 | `tools/check_reascript.lua` | Compiles a script and nil-checks every `reaper.*` symbol it calls, without running it. |
 | `tools/Invoke-ReaperSandbox.ps1` | Runs a script in an isolated REAPER instance, optionally fully off-screen. |
 | `docs/` | Diagnoses and post-mortems. |
+| `docs/DC-BRIEF.md` | Self-contained paste-in briefing for a chat-only agent. |
+| `tools/Copy-DCBrief.ps1` | Puts that brief on the clipboard. `-WithScript` appends the full source. |
 | `install.ps1` | Copies `scripts/*.lua` into `%APPDATA%\REAPER\Scripts\`, backing up what it replaces. |
+
+## Handing work to an agent with no file access
+
+DC and other chat-only agents cannot read the repo, clone a remote, or open a path — so a git
+remote does not help them. Pasted text is the only channel that always works. `docs/DC-BRIEF.md`
+is written to be self-contained for exactly that, and:
+
+```powershell
+.\tools\Copy-DCBrief.ps1              # brief onto the clipboard
+.\tools\Copy-DCBrief.ps1 -WithScript  # brief + full script source
+```
 
 ## The two rules that matter
 
